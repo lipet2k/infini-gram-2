@@ -242,6 +242,37 @@ def build_sa(args):
         end_time_all = time.time()
         print(f'Step 2 (build_sa): Done. Took {end_time_all-start_time_all:.2f} seconds', flush=True)
 
+def build_bloom(args):
+
+    ds_paths = [os.path.join(args.save_dir, f'tokenized.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+    bl_paths = [os.path.join(args.save_dir, f'bloom.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+
+    if all([os.path.exists(bl_path) for bl_path in bl_paths]):
+        print('Step 3 (build_bloom): Skipped. All bloom filter files already exist.')
+        return
+
+    print('Step 3 (build_bloom): Starting ...')
+
+    os.chdir(os.path.dirname(os.path.realpath(__file__)))
+
+    num_bits = args.bloom_size_mb * 1024 * 1024 * 8
+
+    for t, (ds_path, bl_path) in enumerate(zip(ds_paths, bl_paths)):
+        if os.path.exists(bl_path):
+            print(f'Shard {t}: bloom file already exists. Skipping.', flush=True)
+            continue
+        print(f'Shard {t} / {len(ds_paths)}: Building bloom filter ...', flush=True)
+        start_time = time.time()
+        pipe = os.popen(f'./rust_indexing build-bloom --data-file {ds_path} --bloom-file {bl_path} --num-bits {num_bits} --num-hashes {args.bloom_num_hashes} --max-ngram-n {args.bloom_max_n} --token-width {args.token_width}')
+        pipe.read()
+        if pipe.close() is not None:
+            print(f'Shard {t}: Something went wrong building bloom filter', flush=True)
+            exit(1)
+        end_time = time.time()
+        print(f'Shard {t}: Done. Took {end_time - start_time:.2f} seconds', flush=True)
+
+    print('Step 3 (build_bloom): Done.')
+
 def main():
 
     parser = argparse.ArgumentParser()
@@ -253,6 +284,10 @@ def main():
     parser.add_argument('--token_dtype', type=str, default='u16', choices=['u8', 'u16', 'u32'], help='Data type for tokens.')
     parser.add_argument('--add_metadata', default=False, action='store_true', help='Whether to store document metadata in the index.')
     parser.add_argument('--add_unigram', default=False, action='store_true', help='Whether to precompute unigram counts.')
+    parser.add_argument('--add_bloom', default=False, action='store_true', help='Whether to build Bloom filters for 2-4 gram negative query filtering.')
+    parser.add_argument('--bloom_size_mb', type=int, default=256, help='Bloom filter size in MB per shard (default: 256).')
+    parser.add_argument('--bloom_num_hashes', type=int, default=7, help='Number of hash functions for Bloom filter (default: 7).')
+    parser.add_argument('--bloom_max_n', type=int, default=4, help='Maximum n-gram order for Bloom filter (default: 4).')
     parser.add_argument('--shards', type=int, default=1, help='Number of shards to split the index into.')
     parser.add_argument('--workers', type=int, default=1, help='Total number of workers. Must be a divisor of shards.')
     parser.add_argument('--worker_id', type=int, default=0, help='The worker ID of this process. Must be in range [0, workers).')
@@ -301,6 +336,8 @@ def main():
 
     tokenize(args)
     build_sa(args)
+    if args.add_bloom:
+        build_bloom(args)
 
 if __name__ == '__main__':
     main()
