@@ -419,9 +419,14 @@ def test_performance(index, num_queries=500):
         t1, t2, t3 = int(tokens[i]), int(tokens[i + 1]), int(tokens[i + 2])
         if doc_sep in (t1, t2, t3):
             continue
-        existing_queries_2.append([t1, t2])
-        existing_queries_3.append([t1, t2, t3])
-        if len(existing_queries_3) >= num_queries:
+        # Alternate between 2-gram and 3-gram lists so they draw from
+        # independent positions rather than being prefix/superset pairs
+        if len(existing_queries_2) <= len(existing_queries_3):
+            existing_queries_2.append([t1, t2])
+        else:
+            existing_queries_3.append([t1, t2, t3])
+        if (len(existing_queries_2) >= num_queries and
+                len(existing_queries_3) >= num_queries):
             break
 
     # Generate non-existing queries
@@ -430,53 +435,63 @@ def test_performance(index, num_queries=500):
     nonexist_queries = [[int(x) for x in np.random.randint(0, max_tok, size=3)]
                         for _ in range(num_queries)]
 
-    def benchmark(name, queries, search_fn):
-        total_comparisons = 0
-        total_results = 0
-        start = time.perf_counter()
+    import random as _rng
+    _rng.seed(42)
+
+    def benchmark_interleaved(queries, search_fns):
+        """Run search functions in randomized order per-query to avoid page cache bias."""
+        n_fns = len(search_fns)
+        totals = [{'time': 0.0, 'comps': 0, 'results': 0} for _ in range(n_fns)]
         for q in queries:
-            left, right, comps = search_fn(q)
-            total_comparisons += comps
-            total_results += right - left
-        elapsed = time.perf_counter() - start
-        avg_comps = total_comparisons / len(queries) if queries else 0
-        return elapsed, avg_comps, total_results
+            order = list(range(n_fns))
+            _rng.shuffle(order)
+            for idx in order:
+                start = time.perf_counter()
+                left, right, comps = search_fns[idx](q)
+                elapsed = time.perf_counter() - start
+                totals[idx]['time'] += elapsed
+                totals[idx]['comps'] += comps
+                totals[idx]['results'] += right - left
+        n = len(queries) if queries else 1
+        return [(t['time'], t['comps'] / n, t['results']) for t in totals]
 
     print(f"\nlog2(tok_cnt) = {np.log2(index.tok_cnt):.1f} "
           f"(max comparisons per search without cache)")
     if index.bigram_cache:
         print(f"Bigram cache entries: {len(index.bigram_cache):,}")
 
+    # Warmup pass to load mmap pages into OS page cache
+    print("\n  (warming up page cache ...)")
+    for q in existing_queries_2[:50]:
+        index.search_baseline(q)
+    for q in existing_queries_3[:50]:
+        index.search_baseline(q)
+
+    fns = [index.search_baseline, index.search_with_bigram,
+           index.search_with_bloom_and_bigram]
+    labels = ["Baseline", "Bigram", "Bloom+Bigram"]
+
     # Benchmark existing 2-gram queries
     print(f"\n--- Existing 2-gram queries (n={len(existing_queries_2)}) ---")
-    t1, c1, r1 = benchmark("Baseline", existing_queries_2, index.search_baseline)
-    t2, c2, r2 = benchmark("Bigram", existing_queries_2, index.search_with_bigram)
-    t3, c3, r3 = benchmark("Bloom+Bigram", existing_queries_2, index.search_with_bloom_and_bigram)
-    print(f"  Baseline:     {t1:.3f}s, avg {c1:.1f} comparisons, {r1:,} total results")
-    print(f"  Bigram:       {t2:.3f}s, avg {c2:.1f} comparisons, {r2:,} total results")
-    print(f"  Bloom+Bigram: {t3:.3f}s, avg {c3:.1f} comparisons, {r3:,} total results")
-    if c1 > 0:
-        print(f"  Comparison reduction: {(1 - c2/c1)*100:.1f}%")
+    results = benchmark_interleaved(existing_queries_2, fns)
+    for label, (t, c, r) in zip(labels, results):
+        print(f"  {label+':':15s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
+    if results[0][1] > 0:
+        print(f"  Comparison reduction: {(1 - results[1][1]/results[0][1])*100:.1f}%")
 
     # Benchmark existing 3-gram queries
     print(f"\n--- Existing 3-gram queries (n={len(existing_queries_3)}) ---")
-    t1, c1, r1 = benchmark("Baseline", existing_queries_3, index.search_baseline)
-    t2, c2, r2 = benchmark("Bigram", existing_queries_3, index.search_with_bigram)
-    t3, c3, r3 = benchmark("Bloom+Bigram", existing_queries_3, index.search_with_bloom_and_bigram)
-    print(f"  Baseline:     {t1:.3f}s, avg {c1:.1f} comparisons, {r1:,} total results")
-    print(f"  Bigram:       {t2:.3f}s, avg {c2:.1f} comparisons, {r2:,} total results")
-    print(f"  Bloom+Bigram: {t3:.3f}s, avg {c3:.1f} comparisons, {r3:,} total results")
-    if c1 > 0:
-        print(f"  Comparison reduction: {(1 - c2/c1)*100:.1f}%")
+    results = benchmark_interleaved(existing_queries_3, fns)
+    for label, (t, c, r) in zip(labels, results):
+        print(f"  {label+':':15s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
+    if results[0][1] > 0:
+        print(f"  Comparison reduction: {(1 - results[1][1]/results[0][1])*100:.1f}%")
 
     # Benchmark non-existing queries
     print(f"\n--- Non-existing random queries (n={len(nonexist_queries)}) ---")
-    t1, c1, r1 = benchmark("Baseline", nonexist_queries, index.search_baseline)
-    t2, c2, r2 = benchmark("Bigram", nonexist_queries, index.search_with_bigram)
-    t3, c3, r3 = benchmark("Bloom+Bigram", nonexist_queries, index.search_with_bloom_and_bigram)
-    print(f"  Baseline:     {t1:.3f}s, avg {c1:.1f} comparisons, {r1:,} total results")
-    print(f"  Bigram:       {t2:.3f}s, avg {c2:.1f} comparisons, {r2:,} total results")
-    print(f"  Bloom+Bigram: {t3:.3f}s, avg {c3:.1f} comparisons, {r3:,} total results")
+    results = benchmark_interleaved(nonexist_queries, fns)
+    for label, (t, c, r) in zip(labels, results):
+        print(f"  {label+':':15s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
 
     # Count bloom filter rejections
     bloom_rejections = sum(1 for q in nonexist_queries if index.bloom_check(q))
