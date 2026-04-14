@@ -273,6 +273,43 @@ def build_bloom(args):
 
     print('Step 3 (build_bloom): Done.')
 
+def build_bigram(args):
+
+    ds_paths = [os.path.join(args.save_dir, f'tokenized.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+    sa_paths = [os.path.join(args.save_dir, f'table.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+    bg_paths = [os.path.join(args.save_dir, f'bigram.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+
+    if all([os.path.exists(bg_path) for bg_path in bg_paths]):
+        print('Step 4 (build_bigram): Skipped. All bigram index files already exist.')
+        return
+
+    print('Step 4 (build_bigram): Starting ...')
+
+    os.chdir(os.path.dirname(os.path.realpath(__file__)))
+
+    for t, (ds_path, sa_path, bg_path) in enumerate(zip(ds_paths, sa_paths, bg_paths)):
+        if os.path.exists(bg_path):
+            print(f'Shard {t}: bigram file already exists. Skipping.', flush=True)
+            continue
+        if not os.path.exists(sa_path):
+            print(f'Shard {t}: table file does not exist. Run build_sa first.', flush=True)
+            exit(1)
+        print(f'Shard {t} / {len(ds_paths)}: Building bigram index ...', flush=True)
+        start_time = time.time()
+
+        ds_size = os.path.getsize(ds_path)
+        ratio = int(np.ceil(np.log2(ds_size) / 8))
+
+        pipe = os.popen(f'./rust_indexing build-bigram --data-file {ds_path} --table-file {sa_path} --bigram-file {bg_path} --token-width {args.token_width} --ratio {ratio}')
+        pipe.read()
+        if pipe.close() is not None:
+            print(f'Shard {t}: Something went wrong building bigram index', flush=True)
+            exit(1)
+        end_time = time.time()
+        print(f'Shard {t}: Done. Took {end_time - start_time:.2f} seconds', flush=True)
+
+    print('Step 4 (build_bigram): Done.')
+
 def main():
 
     parser = argparse.ArgumentParser()
@@ -285,6 +322,7 @@ def main():
     parser.add_argument('--add_metadata', default=False, action='store_true', help='Whether to store document metadata in the index.')
     parser.add_argument('--add_unigram', default=False, action='store_true', help='Whether to precompute unigram counts.')
     parser.add_argument('--add_bloom', default=False, action='store_true', help='Whether to build Bloom filters for 2-4 gram negative query filtering.')
+    parser.add_argument('--add_bigram', default=False, action='store_true', help='Whether to build 2-gram index for faster query lookup.')
     parser.add_argument('--bloom_size_mb', type=int, default=256, help='Bloom filter size in MB per shard (default: 256).')
     parser.add_argument('--bloom_num_hashes', type=int, default=7, help='Number of hash functions for Bloom filter (default: 7).')
     parser.add_argument('--bloom_max_n', type=int, default=4, help='Maximum n-gram order for Bloom filter (default: 4).')
@@ -299,9 +337,9 @@ def main():
 
     if args.temp_dir is None:
         args.temp_dir = args.save_dir
-    args.data_dir = args.data_dir.rstrip('/')
-    args.temp_dir = args.temp_dir.rstrip('/')
-    args.save_dir = args.save_dir.rstrip('/')
+    args.data_dir = os.path.realpath(args.data_dir.rstrip('/'))
+    args.temp_dir = os.path.realpath(args.temp_dir.rstrip('/'))
+    args.save_dir = os.path.realpath(args.save_dir.rstrip('/'))
 
     assert args.batch_size > 0
     assert args.cpus > 0
@@ -338,6 +376,8 @@ def main():
     build_sa(args)
     if args.add_bloom:
         build_bloom(args)
+    if args.add_bigram:
+        build_bigram(args)
 
 if __name__ == '__main__':
     main()

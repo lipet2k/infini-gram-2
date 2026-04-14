@@ -16,6 +16,7 @@
 #include <thread>
 #include <fstream>
 #include <deque>
+#include <unordered_map>
 
 #define U64 uint64_t
 #define U32 uint32_t
@@ -153,13 +154,32 @@ public:
 
         for (const auto &index_dir : index_dirs) {
             if (prev_shards_by_index_dir.find(index_dir) != prev_shards_by_index_dir.end()) {
+                size_t num_prev = prev_shards_by_index_dir[index_dir].size();
                 _shards.insert(_shards.end(), prev_shards_by_index_dir[index_dir].begin(), prev_shards_by_index_dir[index_dir].end());
+                // Load bigram caches for prev shards (they are small and cheap to reload)
+                vector<string> bg_paths_prev;
+                if (fs::exists(index_dir)) {
+                    for (const auto &entry : fs::directory_iterator(index_dir)) {
+                        if (entry.path().string().find("bigram") != string::npos) {
+                            bg_paths_prev.push_back(entry.path());
+                        }
+                    }
+                    sort(bg_paths_prev.begin(), bg_paths_prev.end());
+                }
+                for (size_t s = 0; s < num_prev; s++) {
+                    if (s < bg_paths_prev.size()) {
+                        _load_bigram_cache_file(bg_paths_prev[s]);
+                    } else {
+                        _has_bigram_cache.push_back(false);
+                        _bigram_caches.push_back({});
+                    }
+                }
                 continue;
             }
 
             assert (fs::exists(index_dir));
 
-            vector<string> ds_paths, sa_paths, od_paths, mt_paths, om_paths, ug_paths;
+            vector<string> ds_paths, sa_paths, od_paths, mt_paths, om_paths, ug_paths, bg_paths;
             for (const auto &entry : fs::directory_iterator(index_dir)) {
                 if (entry.path().string().find("tokenized") != string::npos) {
                     ds_paths.push_back(entry.path());
@@ -173,6 +193,8 @@ public:
                     om_paths.push_back(entry.path());
                 } else if (entry.path().string().find("unigram") != string::npos) {
                     ug_paths.push_back(entry.path());
+                } else if (entry.path().string().find("bigram") != string::npos) {
+                    bg_paths.push_back(entry.path());
                 }
             }
             sort(ds_paths.begin(), ds_paths.end());
@@ -180,6 +202,7 @@ public:
             sort(od_paths.begin(), od_paths.end());
             sort(mt_paths.begin(), mt_paths.end());
             sort(om_paths.begin(), om_paths.end());
+            sort(bg_paths.begin(), bg_paths.end());
             assert (sa_paths.size() == ds_paths.size());
             assert (od_paths.size() == ds_paths.size());
             assert (mt_paths.size() == 0 || mt_paths.size() == ds_paths.size());
@@ -237,6 +260,14 @@ public:
                     for (const auto &[token_id, count] : shard_unigram_counts) {
                         unigram_counts[token_id] += count;
                     }
+                }
+
+                // Load bigram cache for this shard
+                if (s < bg_paths.size()) {
+                    _load_bigram_cache_file(bg_paths[s]);
+                } else {
+                    _has_bigram_cache.push_back(false);
+                    _bigram_caches.push_back({});
                 }
             }
         }
@@ -342,8 +373,19 @@ public:
     FindResult find(const vector<T> input_ids) const {
 
         vector<pair<U64, U64>> hint_segment_by_shard;
-        for (const auto &shard : _shards) {
-            hint_segment_by_shard.push_back({0, shard.tok_cnt});
+        for (size_t s = 0; s < _num_shards; s++) {
+            if (input_ids.size() >= 2 && _has_bigram_cache[s]) {
+                U64 key = _make_bigram_key(input_ids);
+                auto it = _bigram_caches[s].find(key);
+                if (it != _bigram_caches[s].end()) {
+                    hint_segment_by_shard.push_back(it->second);
+                } else {
+                    // 2-gram not in data for this shard — no results possible
+                    hint_segment_by_shard.push_back({0, 0});
+                }
+            } else {
+                hint_segment_by_shard.push_back({0, _shards[s].tok_cnt});
+            }
         }
         return _find(input_ids, hint_segment_by_shard);
     }
@@ -1571,6 +1613,44 @@ private:
         return ptr;
     }
 
+    inline U64 _make_bigram_key(const vector<T> &input_ids) const {
+        T t1, t2;
+        if (_version == 4) {
+            t1 = input_ids[0];
+            t2 = input_ids[1];
+        } else { // version 5: query gets reversed, so first 2 reversed tokens are last 2 original
+            t1 = input_ids[input_ids.size() - 1];
+            t2 = input_ids[input_ids.size() - 2];
+        }
+        U64 key = 0;
+        memcpy(&key, &t1, sizeof(T));
+        memcpy(reinterpret_cast<U8*>(&key) + sizeof(T), &t2, sizeof(T));
+        return key;
+    }
+
+    void _load_bigram_cache_file(const string &path) {
+        auto [data, size] = load_file(path);
+        U64 num_entries;
+        memcpy(&num_entries, data, 8);
+        U32 tw;
+        memcpy(&tw, data + 8, 4);
+        assert(tw == sizeof(T));
+
+        unordered_map<U64, pair<U64, U64>> cache;
+        cache.reserve(num_entries);
+        U8 *ptr = data + 16; // skip header
+        for (U64 i = 0; i < num_entries; i++) {
+            U64 key, lo, hi;
+            memcpy(&key, ptr, 8); ptr += 8;
+            memcpy(&lo, ptr, 8); ptr += 8;
+            memcpy(&hi, ptr, 8); ptr += 8;
+            cache[key] = {lo, hi};
+        }
+        _has_bigram_cache.push_back(true);
+        _bigram_caches.push_back(std::move(cache));
+        unload_file(data, size);
+    }
+
     inline pair<U64, U64> _bin_search(const vector<U64> &arr, U64 val) const {
         U64 lo = -1, hi = arr.size(); // lo is always < val, hi is always >= val
         while (hi - lo > 1) {
@@ -1601,6 +1681,8 @@ private:
     vector<DatastoreShard> _shards;
     map<string, vector<DatastoreShard>> _new_shards_by_index_dir;
     map<T, double> _unigram_logprobs;
+    vector<bool> _has_bigram_cache;
+    vector<unordered_map<U64, pair<U64, U64>>> _bigram_caches;
 
     friend class EngineDiff<T>;
 };

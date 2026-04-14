@@ -126,6 +126,19 @@ enum Commands {
         max_ngram_n: u32,
         #[clap(short, long)]
         token_width: usize,
+    },
+
+    BuildBigram {
+        #[clap(short, long)]
+        data_file: String,
+        #[clap(long)]
+        table_file: String,
+        #[clap(long)]
+        bigram_file: String,
+        #[clap(short, long)]
+        token_width: usize,
+        #[clap(short, long)]
+        ratio: usize,
     }
 
 }
@@ -636,6 +649,107 @@ fn cmd_build_bloom(data_file: &String, bloom_file: &String,
     Ok(())
 }
 
+/*
+ * Build a 2-gram index that maps every unique bigram (pair of consecutive tokens)
+ * to its [lo, hi) range in the suffix array. At query time, this allows the engine
+ * to skip the initial binary search over the entire SA and instead start from the
+ * narrowed range for the query's first 2 tokens.
+ *
+ * File format:
+ *   Header: num_entries (u64), token_width (u32), padding (u32)
+ *   Entries: bigram_key (u64), lo (u64), hi (u64)
+ *
+ * The bigram_key is the raw 2*token_width bytes from the data file packed into a u64
+ * (zero-extended, little-endian). This matches how the C++ engine constructs keys
+ * from query token IDs via memcpy.
+ */
+fn cmd_build_bigram(data_file: &String, table_file: &String, bigram_file: &String,
+                    token_width: usize, ratio: usize) -> std::io::Result<()> {
+    let now = Instant::now();
+    println!("Building bigram index for {}", data_file);
+
+    let ds = filebuffer::FileBuffer::open(data_file)?;
+    let sa = filebuffer::FileBuffer::open(table_file)?;
+
+    let ds_size = ds.len();
+    let tok_cnt = ds_size / token_width;
+    let bigram_bytes = 2 * token_width;
+
+    assert_eq!(sa.len(), tok_cnt * ratio, "SA size mismatch: expected {} * {} = {}, got {}",
+               tok_cnt, ratio, tok_cnt * ratio, sa.len());
+
+    // We stream entries to disk to avoid holding them all in memory
+    let mut out = std::io::BufWriter::new(File::create(bigram_file)?);
+
+    // Write placeholder header
+    let placeholder_num_entries: u64 = 0;
+    out.write_all(&placeholder_num_entries.to_le_bytes())?;
+    let tw = token_width as u32;
+    out.write_all(&tw.to_le_bytes())?;
+    let padding = 0u32;
+    out.write_all(&padding.to_le_bytes())?;
+
+    let mut num_entries: u64 = 0;
+    let mut prev_key: u64 = u64::MAX; // sentinel: no current group
+    let mut cur_lo: u64 = 0;
+
+    for rank in 0..tok_cnt {
+        // Read suffix array pointer for this rank
+        let mut ptr_bytes = [0u8; 8];
+        ptr_bytes[..ratio].copy_from_slice(&sa[rank * ratio..rank * ratio + ratio]);
+        let ptr = u64::from_le_bytes(ptr_bytes) as usize;
+
+        // Check if suffix is long enough for a 2-gram
+        if ptr + bigram_bytes > ds_size {
+            // Suffix too short — finalize current group if any
+            if prev_key != u64::MAX {
+                out.write_all(&prev_key.to_le_bytes())?;
+                out.write_all(&cur_lo.to_le_bytes())?;
+                out.write_all(&(rank as u64).to_le_bytes())?;
+                num_entries += 1;
+                prev_key = u64::MAX;
+            }
+            continue;
+        }
+
+        // Pack the 2-gram bytes into a u64 key
+        let mut key_bytes = [0u8; 8];
+        key_bytes[..bigram_bytes].copy_from_slice(&ds[ptr..ptr + bigram_bytes]);
+        let key = u64::from_le_bytes(key_bytes);
+
+        if key != prev_key {
+            // Finalize previous group
+            if prev_key != u64::MAX {
+                out.write_all(&prev_key.to_le_bytes())?;
+                out.write_all(&cur_lo.to_le_bytes())?;
+                out.write_all(&(rank as u64).to_le_bytes())?;
+                num_entries += 1;
+            }
+            prev_key = key;
+            cur_lo = rank as u64;
+        }
+    }
+
+    // Finalize last group
+    if prev_key != u64::MAX {
+        out.write_all(&prev_key.to_le_bytes())?;
+        out.write_all(&cur_lo.to_le_bytes())?;
+        out.write_all(&(tok_cnt as u64).to_le_bytes())?;
+        num_entries += 1;
+    }
+
+    out.flush()?;
+    drop(out);
+
+    // Go back and write the actual num_entries in the header
+    let mut header_out = OpenOptions::new().write(true).open(bigram_file)?;
+    header_out.write_all(&num_entries.to_le_bytes())?;
+
+    println!("Bigram index built in {:.2}s, {} unique 2-grams written to {}",
+             now.elapsed().as_secs_f64(), num_entries, bigram_file);
+    Ok(())
+}
+
 fn main()  -> std::io::Result<()> {
 
     let args = Args::parse();
@@ -655,6 +769,10 @@ fn main()  -> std::io::Result<()> {
 
         Commands::BuildBloom { data_file, bloom_file, num_bits, num_hashes, max_ngram_n, token_width } => {
             cmd_build_bloom(data_file, bloom_file, *num_bits, *num_hashes, *max_ngram_n, *token_width)?;
+        }
+
+        Commands::BuildBigram { data_file, table_file, bigram_file, token_width, ratio } => {
+            cmd_build_bigram(data_file, table_file, bigram_file, *token_width, *ratio)?;
         }
     }
 
