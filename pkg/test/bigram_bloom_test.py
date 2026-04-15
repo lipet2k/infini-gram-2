@@ -47,6 +47,29 @@ class SuffixArrayIndex:
         if os.path.exists(bg_path):
             self.bigram_cache = self._load_bigram_cache(bg_path)
 
+        # Build unigram cache from bigram cache: map first token -> (min_lo, max_hi)
+        self.unigram_cache = None
+        if self.bigram_cache is not None:
+            self.unigram_cache = self._build_unigram_cache()
+
+        # Load trigram cache (optional)
+        tg_path = os.path.join(index_dir, 'trigram.0')
+        self.trigram_cache = None
+        if os.path.exists(tg_path):
+            self.trigram_cache = self._load_ngram_cache(tg_path)
+
+        # Load quadgram cache (optional)
+        qg_path = os.path.join(index_dir, 'quadgram.0')
+        self.quadgram_cache = None
+        if os.path.exists(qg_path):
+            self.quadgram_cache = self._load_ngram_cache(qg_path)
+
+        # Load adaptive n-gram index (optional)
+        adaptive_path = os.path.join(index_dir, 'adaptive_ngram.0')
+        self.adaptive_cache = None
+        if os.path.exists(adaptive_path):
+            self.adaptive_cache = self._load_adaptive_ngram(adaptive_path)
+
         # Load bloom filter (optional)
         bl_path = os.path.join(index_dir, 'bloom.0')
         self.bloom = None
@@ -75,6 +98,56 @@ class SuffixArrayIndex:
 
         return cache
 
+    def _load_ngram_cache(self, path):
+        """Load n-gram cache into a dict mapping u64 key -> (lo, hi)."""
+        with open(path, 'rb') as f:
+            num_entries, = struct.unpack('<Q', f.read(8))
+            tw, = struct.unpack('<I', f.read(4))
+            ngram_n, = struct.unpack('<I', f.read(4))
+            assert tw == self.token_width
+
+            cache = {}
+            for _ in range(num_entries):
+                key, lo, hi = struct.unpack('<QQQ', f.read(24))
+                cache[key] = (lo, hi)
+
+        return cache
+
+    def _load_adaptive_ngram(self, path):
+        """Load adaptive n-gram index (ANGR format) into per-level dicts."""
+        with open(path, 'rb') as f:
+            magic = f.read(4)
+            assert magic == b'ANGR', f"Bad magic: {magic}"
+            version, = struct.unpack('<I', f.read(4))
+            assert version == 1
+            tw, = struct.unpack('<I', f.read(4))
+            assert tw == self.token_width
+            max_n, = struct.unpack('<I', f.read(4))
+            num_levels, = struct.unpack('<I', f.read(4))
+            _reserved, = struct.unpack('<I', f.read(4))
+            total_entries, = struct.unpack('<Q', f.read(8))
+
+            # Read level directory
+            level_info = []
+            for _ in range(num_levels):
+                ngram_n, = struct.unpack('<I', f.read(4))
+                _padding, = struct.unpack('<I', f.read(4))
+                num_entries, = struct.unpack('<Q', f.read(8))
+                data_offset, = struct.unpack('<Q', f.read(8))
+                level_info.append((ngram_n, num_entries, data_offset))
+
+            # Read each level's entries
+            caches = {}
+            for ngram_n, num_entries, data_offset in level_info:
+                f.seek(data_offset)
+                cache = {}
+                for _ in range(num_entries):
+                    key, lo, hi = struct.unpack('<QQQ', f.read(24))
+                    cache[key] = (lo, hi)
+                caches[ngram_n] = cache
+
+        return {'max_n': max_n, 'caches': caches, 'total_entries': total_entries}
+
     def _load_bloom_filter(self, path):
         """Load bloom filter data."""
         with open(path, 'rb') as f:
@@ -85,12 +158,29 @@ class SuffixArrayIndex:
         return {'num_bits': num_bits, 'num_hashes': num_hashes,
                 'max_ngram_n': max_ngram_n, 'data': data}
 
+    def _build_unigram_cache(self):
+        """Derive unigram cache from bigram cache by grouping on first token."""
+        cache = {}
+        mask = (1 << (self.token_width * 8)) - 1  # e.g. 0xFFFF for u16
+        for key, (lo, hi) in self.bigram_cache.items():
+            t1 = key & mask  # first token is in the low bits
+            if t1 in cache:
+                old_lo, old_hi = cache[t1]
+                cache[t1] = (min(old_lo, lo), max(old_hi, hi))
+            else:
+                cache[t1] = (lo, hi)
+        return cache
+
     def _make_bigram_key(self, token_ids):
         """Pack first 2 tokens into a u64 key (matching C++ _make_bigram_key)."""
-        key = 0
-        t1_bytes = int(token_ids[0]).to_bytes(self.token_width, 'little')
-        t2_bytes = int(token_ids[1]).to_bytes(self.token_width, 'little')
-        key_bytes = t1_bytes + t2_bytes + b'\x00' * (8 - 2 * self.token_width)
+        return self._make_ngram_key(token_ids, 2)
+
+    def _make_ngram_key(self, token_ids, n):
+        """Pack first n tokens into a u64 key."""
+        key_bytes = b''
+        for i in range(n):
+            key_bytes += int(token_ids[i]).to_bytes(self.token_width, 'little')
+        key_bytes += b'\x00' * (8 - n * self.token_width)
         return struct.unpack('<Q', key_bytes)[0]
 
     def _read_sa_ptr(self, rank):
@@ -187,6 +277,18 @@ class SuffixArrayIndex:
         """Search without any cache (full range)."""
         return self.binary_search(token_ids)
 
+    def search_with_unigram(self, token_ids):
+        """Search with unigram cache hint."""
+        if self.unigram_cache is None or len(token_ids) < 1:
+            return self.binary_search(token_ids)
+
+        t1 = int(token_ids[0])
+        if t1 in self.unigram_cache:
+            lo, hi = self.unigram_cache[t1]
+            return self.binary_search(token_ids, lo, hi)
+        else:
+            return 0, 0, 0
+
     def search_with_bigram(self, token_ids):
         """Search with bigram cache hint."""
         if self.bigram_cache is None or len(token_ids) < 2:
@@ -199,6 +301,30 @@ class SuffixArrayIndex:
         else:
             # Bigram not in data, no results
             return 0, 0, 0
+
+    def search_with_trigram(self, token_ids):
+        """Search with trigram cache hint (falls back to bigram for 2-grams)."""
+        if self.trigram_cache is not None and len(token_ids) >= 3:
+            key = self._make_ngram_key(token_ids, 3)
+            if key in self.trigram_cache:
+                lo, hi = self.trigram_cache[key]
+                return self.binary_search(token_ids, lo, hi)
+            else:
+                return 0, 0, 0
+        # Fall back to bigram for queries shorter than 3
+        return self.search_with_bigram(token_ids)
+
+    def search_with_quadgram(self, token_ids):
+        """Search with quadgram cache hint (falls back to trigram/bigram for shorter queries)."""
+        if self.quadgram_cache is not None and len(token_ids) >= 4:
+            key = self._make_ngram_key(token_ids, 4)
+            if key in self.quadgram_cache:
+                lo, hi = self.quadgram_cache[key]
+                return self.binary_search(token_ids, lo, hi)
+            else:
+                return 0, 0, 0
+        # Fall back to trigram for shorter queries
+        return self.search_with_trigram(token_ids)
 
     def bloom_check(self, token_ids):
         """
@@ -233,14 +359,45 @@ class SuffixArrayIndex:
                 return False
         return True
 
+    def search_with_adaptive(self, token_ids):
+        """Search using adaptive n-gram index with fallback semantics."""
+        if self.adaptive_cache is None:
+            return self.binary_search(token_ids)
+
+        max_n = self.adaptive_cache['max_n']
+        caches = self.adaptive_cache['caches']
+
+        for n in range(min(len(token_ids), max_n), 1, -1):
+            if n not in caches:
+                continue
+            key = self._make_ngram_key(token_ids, n)
+            if key in caches[n]:
+                lo, hi = caches[n][key]
+                return self.binary_search(token_ids, lo, hi)
+            if n == 2:
+                # Bigram is complete — miss means n-gram doesn't exist
+                return 0, 0, 0
+            # Higher level miss: fall back to shorter prefix
+
+        return self.binary_search(token_ids)
+
     def search_with_bloom_and_bigram(self, token_ids):
         """Search with bloom filter pre-check and bigram cache."""
-        # Bloom filter: fast rejection for 2-4 grams
         if self.bloom_check(token_ids):
             return 0, 0, 0
-
-        # Bigram cache: narrow search range
         return self.search_with_bigram(token_ids)
+
+    def search_with_bloom_and_trigram(self, token_ids):
+        """Search with bloom filter pre-check and trigram cache."""
+        if self.bloom_check(token_ids):
+            return 0, 0, 0
+        return self.search_with_trigram(token_ids)
+
+    def search_with_bloom_and_quadgram(self, token_ids):
+        """Search with bloom filter pre-check and quadgram cache."""
+        if self.bloom_check(token_ids):
+            return 0, 0, 0
+        return self.search_with_quadgram(token_ids)
 
     def close(self):
         self.ds_mmap.close()
@@ -273,24 +430,20 @@ def test_correctness(index):
             continue
 
         query = [t1, t2]
-        left_base, right_base, _ = index.search_baseline(query)
-        left_bg, right_bg, _ = index.search_with_bigram(query)
-        left_full, right_full, _ = index.search_with_bloom_and_bigram(query)
-
-        # For existing queries, both position and count must match exactly
-        if (left_base == left_bg == left_full and
-                right_base == right_bg == right_full):
+        cnt_base = index.search_baseline(query)[1] - index.search_baseline(query)[0]
+        cnts = {
+            'bigram': index.search_with_bigram(query),
+            'trigram': index.search_with_trigram(query),
+            'quadgram': index.search_with_quadgram(query),
+            'adaptive': index.search_with_adaptive(query),
+        }
+        all_match = all((r[1] - r[0]) == cnt_base for r in cnts.values())
+        if all_match:
             passed += 1
         else:
-            cnt_base = right_base - left_base
-            cnt_bg = right_bg - left_bg
-            cnt_full = right_full - left_full
-            if cnt_base == cnt_bg == cnt_full:
-                passed += 1  # counts match (different empty-range repr is OK)
-            else:
-                print(f"  FAIL: query={query}, baseline=[{left_base},{right_base}), "
-                      f"bigram=[{left_bg},{right_bg}), full=[{left_full},{right_full})")
-                failed += 1
+            diffs = {k: r[1]-r[0] for k, r in cnts.items() if (r[1]-r[0]) != cnt_base}
+            print(f"  FAIL: query={query}, baseline={cnt_base}, {diffs}")
+            failed += 1
 
     print(f"  {passed} passed, {failed} failed")
 
@@ -304,23 +457,23 @@ def test_correctness(index):
             continue
 
         query = [t1, t2, t3]
-        left_base, right_base, _ = index.search_baseline(query)
-        left_bg, right_bg, _ = index.search_with_bigram(query)
-        left_full, right_full, _ = index.search_with_bloom_and_bigram(query)
-
-        if (left_base == left_bg == left_full and
-                right_base == right_bg == right_full):
+        cnt_base = index.search_baseline(query)[1] - index.search_baseline(query)[0]
+        cnts = {
+            'bigram': index.search_with_bigram(query),
+            'trigram': index.search_with_trigram(query),
+            'quadgram': index.search_with_quadgram(query),
+            'adaptive': index.search_with_adaptive(query),
+            'bloom+bg': index.search_with_bloom_and_bigram(query),
+            'bloom+tg': index.search_with_bloom_and_trigram(query),
+            'bloom+qg': index.search_with_bloom_and_quadgram(query),
+        }
+        all_match = all((r[1] - r[0]) == cnt_base for r in cnts.values())
+        if all_match:
             p2 += 1
         else:
-            cnt_base = right_base - left_base
-            cnt_bg = right_bg - left_bg
-            cnt_full = right_full - left_full
-            if cnt_base == cnt_bg == cnt_full:
-                p2 += 1
-            else:
-                print(f"  FAIL: query={query}, baseline=[{left_base},{right_base}), "
-                      f"bigram=[{left_bg},{right_bg}), full=[{left_full},{right_full})")
-                f2 += 1
+            diffs = {k: r[1]-r[0] for k, r in cnts.items() if (r[1]-r[0]) != cnt_base}
+            print(f"  FAIL: query={query}, baseline={cnt_base}, {diffs}")
+            f2 += 1
     passed += p2
     failed += f2
     print(f"  {p2} passed, {f2} failed")
@@ -334,19 +487,22 @@ def test_correctness(index):
     max_tok = (1 << (index.token_width * 8)) - 2  # exclude doc_sep
     for _ in range(50):
         query = [int(x) for x in np.random.randint(0, max_tok, size=3)]
-        left_base, right_base, _ = index.search_baseline(query)
-        left_bg, right_bg, _ = index.search_with_bigram(query)
-        left_full, right_full, _ = index.search_with_bloom_and_bigram(query)
-
-        cnt_base = right_base - left_base
-        cnt_bg = right_bg - left_bg
-        cnt_full = right_full - left_full
-
-        if cnt_base == cnt_bg == cnt_full:
+        cnt_base = index.search_baseline(query)[1] - index.search_baseline(query)[0]
+        cnts = {
+            'bigram': index.search_with_bigram(query),
+            'trigram': index.search_with_trigram(query),
+            'quadgram': index.search_with_quadgram(query),
+            'adaptive': index.search_with_adaptive(query),
+            'bloom+bg': index.search_with_bloom_and_bigram(query),
+            'bloom+tg': index.search_with_bloom_and_trigram(query),
+            'bloom+qg': index.search_with_bloom_and_quadgram(query),
+        }
+        all_match = all((r[1] - r[0]) == cnt_base for r in cnts.values())
+        if all_match:
             p3 += 1
         else:
-            print(f"  FAIL: query={query}, baseline_cnt={cnt_base}, "
-                  f"bigram_cnt={cnt_bg}, full_cnt={cnt_full}")
+            diffs = {k: r[1]-r[0] for k, r in cnts.items() if (r[1]-r[0]) != cnt_base}
+            print(f"  FAIL: query={query}, baseline={cnt_base}, {diffs}")
             f3 += 1
     passed += p3
     failed += f3
@@ -409,30 +565,32 @@ def test_performance(index, num_queries=500):
     print("=" * 60)
 
     # Generate test queries from actual data
-    ds_bytes = index.ds_mmap[:min(50000, index.ds_size)]
+    # Need enough data for num_queries * 3 lists * stride — read generously
+    read_size = min(max(num_queries * 40, 100000), index.ds_size)
+    ds_bytes = index.ds_mmap[:read_size]
     tokens = np.frombuffer(ds_bytes, dtype=index.dtype)
     doc_sep = (1 << (index.token_width * 8)) - 1
 
     existing_queries_2 = []
     existing_queries_3 = []
-    for i in range(0, len(tokens) - 3, 7):
-        t1, t2, t3 = int(tokens[i]), int(tokens[i + 1]), int(tokens[i + 2])
-        if doc_sep in (t1, t2, t3):
+    existing_queries_4 = []
+    query_lists = [existing_queries_2, existing_queries_3, existing_queries_4]
+    qi = 0  # round-robin index into query_lists
+    for i in range(0, len(tokens) - 4, 11):
+        toks = [int(tokens[i + j]) for j in range(4)]
+        if doc_sep in toks:
             continue
-        # Alternate between 2-gram and 3-gram lists so they draw from
-        # independent positions rather than being prefix/superset pairs
-        if len(existing_queries_2) <= len(existing_queries_3):
-            existing_queries_2.append([t1, t2])
-        else:
-            existing_queries_3.append([t1, t2, t3])
-        if (len(existing_queries_2) >= num_queries and
-                len(existing_queries_3) >= num_queries):
+        # Round-robin across 2/3/4-gram lists so they draw from independent positions
+        n = qi % 3
+        query_lists[n].append(toks[:n + 2])
+        qi += 1
+        if all(len(ql) >= num_queries for ql in query_lists):
             break
 
     # Generate non-existing queries
     np.random.seed(123)
     max_tok = doc_sep - 1
-    nonexist_queries = [[int(x) for x in np.random.randint(0, max_tok, size=3)]
+    nonexist_queries = [[int(x) for x in np.random.randint(0, max_tok, size=4)]
                         for _ in range(num_queries)]
 
     import random as _rng
@@ -457,8 +615,80 @@ def test_performance(index, num_queries=500):
 
     print(f"\nlog2(tok_cnt) = {np.log2(index.tok_cnt):.1f} "
           f"(max comparisons per search without cache)")
+
+    import sys
+    def fmt_size(nbytes):
+        if nbytes >= 1 << 30:
+            return f"{nbytes / (1 << 30):.2f} GB"
+        elif nbytes >= 1 << 20:
+            return f"{nbytes / (1 << 20):.1f} MB"
+        elif nbytes >= 1 << 10:
+            return f"{nbytes / (1 << 10):.1f} KB"
+        return f"{nbytes} B"
+
+    def dict_mem_size(d):
+        """Estimate memory of a dict mapping int/u64 -> (int, int)."""
+        if d is None:
+            return 0
+        return sys.getsizeof(d) + len(d) * (
+            sys.getsizeof(0) +          # key (int)
+            sys.getsizeof((0, 0))  +    # value (tuple)
+            2 * sys.getsizeof(0)        # two ints inside tuple
+        )
+
+    print(f"\n{'Data structure':<20s} {'Entries':>12s} {'On-disk':>12s} {'In-memory':>12s}")
+    print(f"{'-'*20} {'-'*12} {'-'*12} {'-'*12}")
+
+    # Suffix array
+    sa_disk = index.tok_cnt * index.ptr_size
+    print(f"{'Suffix array':<20s} {index.tok_cnt:>12,} {fmt_size(sa_disk):>12s} {fmt_size(sa_disk):>12s}")
+
+    # Tokenized data
+    ds_disk = index.ds_size
+    print(f"{'Tokenized data':<20s} {index.tok_cnt:>12,} {fmt_size(ds_disk):>12s} {fmt_size(ds_disk):>12s}")
+
+    # Bloom filter
+    if index.bloom:
+        bl_disk_path = os.path.join(index.index_dir, 'bloom.0')
+        bl_disk = os.path.getsize(bl_disk_path) if os.path.exists(bl_disk_path) else 0
+        bl_mem = len(index.bloom['data']) + 16  # data + header fields
+        print(f"{'Bloom filter':<20s} {index.bloom['num_bits']:>12,} {fmt_size(bl_disk):>12s} {fmt_size(bl_mem):>12s}")
+
+    # Unigram cache
+    if index.unigram_cache:
+        ug_mem = dict_mem_size(index.unigram_cache)
+        print(f"{'Unigram cache':<20s} {len(index.unigram_cache):>12,} {'(derived)':>12s} {fmt_size(ug_mem):>12s}")
+
+    # Bigram cache
     if index.bigram_cache:
-        print(f"Bigram cache entries: {len(index.bigram_cache):,}")
+        bg_disk_path = os.path.join(index.index_dir, 'bigram.0')
+        bg_disk = os.path.getsize(bg_disk_path) if os.path.exists(bg_disk_path) else 0
+        bg_mem = dict_mem_size(index.bigram_cache)
+        print(f"{'Bigram cache':<20s} {len(index.bigram_cache):>12,} {fmt_size(bg_disk):>12s} {fmt_size(bg_mem):>12s}")
+
+    # Trigram cache
+    if index.trigram_cache:
+        tg_disk_path = os.path.join(index.index_dir, 'trigram.0')
+        tg_disk = os.path.getsize(tg_disk_path) if os.path.exists(tg_disk_path) else 0
+        tg_mem = dict_mem_size(index.trigram_cache)
+        print(f"{'Trigram cache':<20s} {len(index.trigram_cache):>12,} {fmt_size(tg_disk):>12s} {fmt_size(tg_mem):>12s}")
+
+    # Quadgram cache
+    if index.quadgram_cache:
+        qg_disk_path = os.path.join(index.index_dir, 'quadgram.0')
+        qg_disk = os.path.getsize(qg_disk_path) if os.path.exists(qg_disk_path) else 0
+        qg_mem = dict_mem_size(index.quadgram_cache)
+        print(f"{'Quadgram cache':<20s} {len(index.quadgram_cache):>12,} {fmt_size(qg_disk):>12s} {fmt_size(qg_mem):>12s}")
+
+    # Adaptive n-gram cache
+    if index.adaptive_cache:
+        ad_disk_path = os.path.join(index.index_dir, 'adaptive_ngram.0')
+        ad_disk = os.path.getsize(ad_disk_path) if os.path.exists(ad_disk_path) else 0
+        ad_total = index.adaptive_cache['total_entries']
+        ad_mem = sum(dict_mem_size(c) for c in index.adaptive_cache['caches'].values())
+        print(f"{'Adaptive cache':<20s} {ad_total:>12,} {fmt_size(ad_disk):>12s} {fmt_size(ad_mem):>12s}")
+        for n, cache in sorted(index.adaptive_cache['caches'].items()):
+            print(f"  {'level '+str(n):<18s} {len(cache):>12,}")
 
     # Warmup pass to load mmap pages into OS page cache
     print("\n  (warming up page cache ...)")
@@ -466,32 +696,50 @@ def test_performance(index, num_queries=500):
         index.search_baseline(q)
     for q in existing_queries_3[:50]:
         index.search_baseline(q)
+    for q in existing_queries_4[:50]:
+        index.search_baseline(q)
 
-    fns = [index.search_baseline, index.search_with_bigram,
-           index.search_with_bloom_and_bigram]
-    labels = ["Baseline", "Bigram", "Bloom+Bigram"]
+    fns = [index.search_baseline, index.search_with_unigram,
+           index.search_with_bigram, index.search_with_trigram,
+           index.search_with_quadgram, index.search_with_adaptive,
+           index.search_with_bloom_and_bigram,
+           index.search_with_bloom_and_trigram,
+           index.search_with_bloom_and_quadgram]
+    labels = ["Baseline", "Unigram", "Bigram", "Trigram", "Quadgram",
+              "Adaptive", "Bloom+Bigram", "Bloom+Trigram", "Bloom+Quadgram"]
+
+    def print_reductions(results):
+        if results[0][1] > 0:
+            for i, name in enumerate(labels[1:], 1):
+                if i < len(results):
+                    print(f"  Comparison reduction ({name:16s}): {(1 - results[i][1]/results[0][1])*100:.1f}%")
 
     # Benchmark existing 2-gram queries
     print(f"\n--- Existing 2-gram queries (n={len(existing_queries_2)}) ---")
     results = benchmark_interleaved(existing_queries_2, fns)
     for label, (t, c, r) in zip(labels, results):
-        print(f"  {label+':':15s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
-    if results[0][1] > 0:
-        print(f"  Comparison reduction: {(1 - results[1][1]/results[0][1])*100:.1f}%")
+        print(f"  {label+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
+    print_reductions(results)
 
     # Benchmark existing 3-gram queries
     print(f"\n--- Existing 3-gram queries (n={len(existing_queries_3)}) ---")
     results = benchmark_interleaved(existing_queries_3, fns)
     for label, (t, c, r) in zip(labels, results):
-        print(f"  {label+':':15s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
-    if results[0][1] > 0:
-        print(f"  Comparison reduction: {(1 - results[1][1]/results[0][1])*100:.1f}%")
+        print(f"  {label+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
+    print_reductions(results)
+
+    # Benchmark existing 4-gram queries
+    print(f"\n--- Existing 4-gram queries (n={len(existing_queries_4)}) ---")
+    results = benchmark_interleaved(existing_queries_4, fns)
+    for label, (t, c, r) in zip(labels, results):
+        print(f"  {label+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
+    print_reductions(results)
 
     # Benchmark non-existing queries
     print(f"\n--- Non-existing random queries (n={len(nonexist_queries)}) ---")
     results = benchmark_interleaved(nonexist_queries, fns)
     for label, (t, c, r) in zip(labels, results):
-        print(f"  {label+':':15s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
+        print(f"  {label+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
 
     # Count bloom filter rejections
     bloom_rejections = sum(1 for q in nonexist_queries if index.bloom_check(q))

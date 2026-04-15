@@ -156,15 +156,21 @@ public:
             if (prev_shards_by_index_dir.find(index_dir) != prev_shards_by_index_dir.end()) {
                 size_t num_prev = prev_shards_by_index_dir[index_dir].size();
                 _shards.insert(_shards.end(), prev_shards_by_index_dir[index_dir].begin(), prev_shards_by_index_dir[index_dir].end());
-                // Load bigram caches for prev shards (they are small and cheap to reload)
-                vector<string> bg_paths_prev;
+                // Load bigram/trigram/quadgram caches for prev shards (they are small and cheap to reload)
+                vector<string> bg_paths_prev, tg_paths_prev, qg_paths_prev;
                 if (fs::exists(index_dir)) {
                     for (const auto &entry : fs::directory_iterator(index_dir)) {
-                        if (entry.path().string().find("bigram") != string::npos) {
+                        if (entry.path().string().find("quadgram") != string::npos) {
+                            qg_paths_prev.push_back(entry.path());
+                        } else if (entry.path().string().find("trigram") != string::npos) {
+                            tg_paths_prev.push_back(entry.path());
+                        } else if (entry.path().string().find("bigram") != string::npos) {
                             bg_paths_prev.push_back(entry.path());
                         }
                     }
                     sort(bg_paths_prev.begin(), bg_paths_prev.end());
+                    sort(tg_paths_prev.begin(), tg_paths_prev.end());
+                    sort(qg_paths_prev.begin(), qg_paths_prev.end());
                 }
                 for (size_t s = 0; s < num_prev; s++) {
                     if (s < bg_paths_prev.size()) {
@@ -173,13 +179,25 @@ public:
                         _has_bigram_cache.push_back(false);
                         _bigram_caches.push_back({});
                     }
+                    if (s < tg_paths_prev.size()) {
+                        _load_trigram_cache_file(tg_paths_prev[s]);
+                    } else {
+                        _has_trigram_cache.push_back(false);
+                        _trigram_caches.push_back({});
+                    }
+                    if (s < qg_paths_prev.size()) {
+                        _load_quadgram_cache_file(qg_paths_prev[s]);
+                    } else {
+                        _has_quadgram_cache.push_back(false);
+                        _quadgram_caches.push_back({});
+                    }
                 }
                 continue;
             }
 
             assert (fs::exists(index_dir));
 
-            vector<string> ds_paths, sa_paths, od_paths, mt_paths, om_paths, ug_paths, bg_paths;
+            vector<string> ds_paths, sa_paths, od_paths, mt_paths, om_paths, ug_paths, bg_paths, tg_paths, qg_paths;
             for (const auto &entry : fs::directory_iterator(index_dir)) {
                 if (entry.path().string().find("tokenized") != string::npos) {
                     ds_paths.push_back(entry.path());
@@ -193,6 +211,10 @@ public:
                     om_paths.push_back(entry.path());
                 } else if (entry.path().string().find("unigram") != string::npos) {
                     ug_paths.push_back(entry.path());
+                } else if (entry.path().string().find("quadgram") != string::npos) {
+                    qg_paths.push_back(entry.path());
+                } else if (entry.path().string().find("trigram") != string::npos) {
+                    tg_paths.push_back(entry.path());
                 } else if (entry.path().string().find("bigram") != string::npos) {
                     bg_paths.push_back(entry.path());
                 }
@@ -203,6 +225,8 @@ public:
             sort(mt_paths.begin(), mt_paths.end());
             sort(om_paths.begin(), om_paths.end());
             sort(bg_paths.begin(), bg_paths.end());
+            sort(tg_paths.begin(), tg_paths.end());
+            sort(qg_paths.begin(), qg_paths.end());
             assert (sa_paths.size() == ds_paths.size());
             assert (od_paths.size() == ds_paths.size());
             assert (mt_paths.size() == 0 || mt_paths.size() == ds_paths.size());
@@ -268,6 +292,22 @@ public:
                 } else {
                     _has_bigram_cache.push_back(false);
                     _bigram_caches.push_back({});
+                }
+
+                // Load trigram cache for this shard
+                if (s < tg_paths.size()) {
+                    _load_trigram_cache_file(tg_paths[s]);
+                } else {
+                    _has_trigram_cache.push_back(false);
+                    _trigram_caches.push_back({});
+                }
+
+                // Load quadgram cache for this shard
+                if (s < qg_paths.size()) {
+                    _load_quadgram_cache_file(qg_paths[s]);
+                } else {
+                    _has_quadgram_cache.push_back(false);
+                    _quadgram_caches.push_back({});
                 }
             }
         }
@@ -374,16 +414,29 @@ public:
 
         vector<pair<U64, U64>> hint_segment_by_shard;
         for (size_t s = 0; s < _num_shards; s++) {
-            if (input_ids.size() >= 2 && _has_bigram_cache[s]) {
-                U64 key = _make_bigram_key(input_ids);
+            bool found_hint = false;
+            // Try quadgram first (tightest range for queries >= 4 tokens)
+            if (!found_hint && input_ids.size() >= 4 && _has_quadgram_cache[s]) {
+                U64 key = _make_ngram_key(input_ids, 4);
+                auto it = _quadgram_caches[s].find(key);
+                hint_segment_by_shard.push_back(it != _quadgram_caches[s].end() ? it->second : make_pair((U64)0, (U64)0));
+                found_hint = true;
+            }
+            // Try trigram (for queries >= 3 tokens)
+            if (!found_hint && input_ids.size() >= 3 && _has_trigram_cache[s]) {
+                U64 key = _make_ngram_key(input_ids, 3);
+                auto it = _trigram_caches[s].find(key);
+                hint_segment_by_shard.push_back(it != _trigram_caches[s].end() ? it->second : make_pair((U64)0, (U64)0));
+                found_hint = true;
+            }
+            // Fall back to bigram for 2-token queries
+            if (!found_hint && input_ids.size() >= 2 && _has_bigram_cache[s]) {
+                U64 key = _make_ngram_key(input_ids, 2);
                 auto it = _bigram_caches[s].find(key);
-                if (it != _bigram_caches[s].end()) {
-                    hint_segment_by_shard.push_back(it->second);
-                } else {
-                    // 2-gram not in data for this shard — no results possible
-                    hint_segment_by_shard.push_back({0, 0});
-                }
-            } else {
+                hint_segment_by_shard.push_back(it != _bigram_caches[s].end() ? it->second : make_pair((U64)0, (U64)0));
+                found_hint = true;
+            }
+            if (!found_hint) {
                 hint_segment_by_shard.push_back({0, _shards[s].tok_cnt});
             }
         }
@@ -1613,22 +1666,22 @@ private:
         return ptr;
     }
 
-    inline U64 _make_bigram_key(const vector<T> &input_ids) const {
-        T t1, t2;
-        if (_version == 4) {
-            t1 = input_ids[0];
-            t2 = input_ids[1];
-        } else { // version 5: query gets reversed, so first 2 reversed tokens are last 2 original
-            t1 = input_ids[input_ids.size() - 1];
-            t2 = input_ids[input_ids.size() - 2];
-        }
+    inline U64 _make_ngram_key(const vector<T> &input_ids, size_t n) const {
         U64 key = 0;
-        memcpy(&key, &t1, sizeof(T));
-        memcpy(reinterpret_cast<U8*>(&key) + sizeof(T), &t2, sizeof(T));
+        for (size_t i = 0; i < n; i++) {
+            T tok;
+            if (_version == 4) {
+                tok = input_ids[i];
+            } else { // version 5: query gets reversed
+                tok = input_ids[input_ids.size() - 1 - i];
+            }
+            memcpy(reinterpret_cast<U8*>(&key) + i * sizeof(T), &tok, sizeof(T));
+        }
         return key;
     }
 
-    void _load_bigram_cache_file(const string &path) {
+    void _load_ngram_cache(const string &path, vector<bool> &has_cache,
+                           vector<unordered_map<U64, pair<U64, U64>>> &caches) {
         auto [data, size] = load_file(path);
         U64 num_entries;
         memcpy(&num_entries, data, 8);
@@ -1646,9 +1699,21 @@ private:
             memcpy(&hi, ptr, 8); ptr += 8;
             cache[key] = {lo, hi};
         }
-        _has_bigram_cache.push_back(true);
-        _bigram_caches.push_back(std::move(cache));
+        has_cache.push_back(true);
+        caches.push_back(std::move(cache));
         unload_file(data, size);
+    }
+
+    void _load_bigram_cache_file(const string &path) {
+        _load_ngram_cache(path, _has_bigram_cache, _bigram_caches);
+    }
+
+    void _load_trigram_cache_file(const string &path) {
+        _load_ngram_cache(path, _has_trigram_cache, _trigram_caches);
+    }
+
+    void _load_quadgram_cache_file(const string &path) {
+        _load_ngram_cache(path, _has_quadgram_cache, _quadgram_caches);
     }
 
     inline pair<U64, U64> _bin_search(const vector<U64> &arr, U64 val) const {
@@ -1683,6 +1748,10 @@ private:
     map<T, double> _unigram_logprobs;
     vector<bool> _has_bigram_cache;
     vector<unordered_map<U64, pair<U64, U64>>> _bigram_caches;
+    vector<bool> _has_trigram_cache;
+    vector<unordered_map<U64, pair<U64, U64>>> _trigram_caches;
+    vector<bool> _has_quadgram_cache;
+    vector<unordered_map<U64, pair<U64, U64>>> _quadgram_caches;
 
     friend class EngineDiff<T>;
 };

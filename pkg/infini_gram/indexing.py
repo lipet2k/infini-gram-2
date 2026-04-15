@@ -310,6 +310,83 @@ def build_bigram(args):
 
     print('Step 4 (build_bigram): Done.')
 
+def build_trigram(args):
+
+    ds_paths = [os.path.join(args.save_dir, f'tokenized.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+    sa_paths = [os.path.join(args.save_dir, f'table.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+    tg_paths = [os.path.join(args.save_dir, f'trigram.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+
+    if all([os.path.exists(tg_path) for tg_path in tg_paths]):
+        print('Step 5 (build_trigram): Skipped. All trigram index files already exist.')
+        return
+
+    print('Step 5 (build_trigram): Starting ...')
+
+    os.chdir(os.path.dirname(os.path.realpath(__file__)))
+
+    for t, (ds_path, sa_path, tg_path) in enumerate(zip(ds_paths, sa_paths, tg_paths)):
+        if os.path.exists(tg_path):
+            print(f'Shard {t}: trigram file already exists. Skipping.', flush=True)
+            continue
+        if not os.path.exists(sa_path):
+            print(f'Shard {t}: table file does not exist. Run build_sa first.', flush=True)
+            exit(1)
+        print(f'Shard {t} / {len(ds_paths)}: Building trigram index ...', flush=True)
+        start_time = time.time()
+
+        ds_size = os.path.getsize(ds_path)
+        ratio = int(np.ceil(np.log2(ds_size) / 8))
+
+        pipe = os.popen(f'./rust_indexing build-trigram --data-file {ds_path} --table-file {sa_path} --trigram-file {tg_path} --token-width {args.token_width} --ratio {ratio}')
+        pipe.read()
+        if pipe.close() is not None:
+            print(f'Shard {t}: Something went wrong building trigram index', flush=True)
+            exit(1)
+        end_time = time.time()
+        print(f'Shard {t}: Done. Took {end_time - start_time:.2f} seconds', flush=True)
+
+    print('Step 5 (build_trigram): Done.')
+
+def build_adaptive_ngram(args):
+
+    ds_paths = [os.path.join(args.save_dir, f'tokenized.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+    sa_paths = [os.path.join(args.save_dir, f'table.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+    ad_paths = [os.path.join(args.save_dir, f'adaptive_ngram.{i}') for i in range(args.worker_id, args.shards, args.workers)]
+
+    if all([os.path.exists(ad_path) for ad_path in ad_paths]):
+        print('Step 6 (build_adaptive_ngram): Skipped. All adaptive index files already exist.')
+        return
+
+    print('Step 6 (build_adaptive_ngram): Starting ...')
+
+    os.chdir(os.path.dirname(os.path.realpath(__file__)))
+
+    for t, (ds_path, sa_path, ad_path) in enumerate(zip(ds_paths, sa_paths, ad_paths)):
+        if os.path.exists(ad_path):
+            print(f'Shard {t}: adaptive index file already exists. Skipping.', flush=True)
+            continue
+        if not os.path.exists(sa_path):
+            print(f'Shard {t}: table file does not exist. Run build_sa first.', flush=True)
+            exit(1)
+        print(f'Shard {t} / {len(ds_paths)}: Building adaptive n-gram index ...', flush=True)
+        start_time = time.time()
+
+        ds_size = os.path.getsize(ds_path)
+        ratio = int(np.ceil(np.log2(ds_size) / 8))
+
+        cmd = (f'./rust_indexing build-adaptive-ngram --data-file {ds_path} --table-file {sa_path} '
+               f'--output-file {ad_path} --token-width {args.token_width} --ratio {ratio} '
+               f'--budget {args.adaptive_budget} --max-n {args.adaptive_max_n} --min-range {args.adaptive_min_range}')
+        pipe = os.popen(cmd)
+        pipe.read()
+        if pipe.close() is not None:
+            print(f'Shard {t}: Something went wrong building adaptive index', flush=True)
+            exit(1)
+        end_time = time.time()
+        print(f'Shard {t}: Done. Took {end_time - start_time:.2f} seconds', flush=True)
+
+    print('Step 6 (build_adaptive_ngram): Done.')
+
 def main():
 
     parser = argparse.ArgumentParser()
@@ -323,6 +400,11 @@ def main():
     parser.add_argument('--add_unigram', default=False, action='store_true', help='Whether to precompute unigram counts.')
     parser.add_argument('--add_bloom', default=False, action='store_true', help='Whether to build Bloom filters for 2-4 gram negative query filtering.')
     parser.add_argument('--add_bigram', default=False, action='store_true', help='Whether to build 2-gram index for faster query lookup.')
+    parser.add_argument('--add_trigram', default=False, action='store_true', help='Whether to build 3-gram index for faster query lookup.')
+    parser.add_argument('--add_adaptive_ngram', default=False, action='store_true', help='Whether to build adaptive n-gram index.')
+    parser.add_argument('--adaptive_budget', type=int, default=10000000, help='Max total entries for adaptive n-gram index (default: 10M).')
+    parser.add_argument('--adaptive_max_n', type=int, default=4, help='Max n-gram order for adaptive index (default: 4).')
+    parser.add_argument('--adaptive_min_range', type=int, default=16, help='Min SA range to consider for expansion (default: 16).')
     parser.add_argument('--bloom_size_mb', type=int, default=256, help='Bloom filter size in MB per shard (default: 256).')
     parser.add_argument('--bloom_num_hashes', type=int, default=7, help='Number of hash functions for Bloom filter (default: 7).')
     parser.add_argument('--bloom_max_n', type=int, default=4, help='Maximum n-gram order for Bloom filter (default: 4).')
@@ -378,6 +460,10 @@ def main():
         build_bloom(args)
     if args.add_bigram:
         build_bigram(args)
+    if args.add_trigram:
+        build_trigram(args)
+    if args.add_adaptive_ngram:
+        build_adaptive_ngram(args)
 
 if __name__ == '__main__':
     main()

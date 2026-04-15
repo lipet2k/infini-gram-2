@@ -139,6 +139,51 @@ enum Commands {
         token_width: usize,
         #[clap(short, long)]
         ratio: usize,
+    },
+
+    BuildTrigram {
+        #[clap(short, long)]
+        data_file: String,
+        #[clap(long)]
+        table_file: String,
+        #[clap(long)]
+        trigram_file: String,
+        #[clap(short, long)]
+        token_width: usize,
+        #[clap(short, long)]
+        ratio: usize,
+    },
+
+    BuildQuadgram {
+        #[clap(short, long)]
+        data_file: String,
+        #[clap(long)]
+        table_file: String,
+        #[clap(long)]
+        quadgram_file: String,
+        #[clap(short, long)]
+        token_width: usize,
+        #[clap(short, long)]
+        ratio: usize,
+    },
+
+    BuildAdaptiveNgram {
+        #[clap(short, long)]
+        data_file: String,
+        #[clap(long)]
+        table_file: String,
+        #[clap(long)]
+        output_file: String,
+        #[clap(short, long)]
+        token_width: usize,
+        #[clap(short, long)]
+        ratio: usize,
+        #[clap(long)]
+        budget: u64,
+        #[clap(long, default_value_t = 4)]
+        max_n: usize,
+        #[clap(long, default_value_t = 16)]
+        min_range: u64,
     }
 
 }
@@ -650,44 +695,45 @@ fn cmd_build_bloom(data_file: &String, bloom_file: &String,
 }
 
 /*
- * Build a 2-gram index that maps every unique bigram (pair of consecutive tokens)
+ * Build an n-gram index that maps every unique n-gram (n consecutive tokens)
  * to its [lo, hi) range in the suffix array. At query time, this allows the engine
  * to skip the initial binary search over the entire SA and instead start from the
- * narrowed range for the query's first 2 tokens.
+ * narrowed range for the query's first n tokens.
  *
  * File format:
- *   Header: num_entries (u64), token_width (u32), padding (u32)
- *   Entries: bigram_key (u64), lo (u64), hi (u64)
+ *   Header: num_entries (u64), token_width (u32), ngram_n (u32)
+ *   Entries: ngram_key (u64), lo (u64), hi (u64)
  *
- * The bigram_key is the raw 2*token_width bytes from the data file packed into a u64
- * (zero-extended, little-endian). This matches how the C++ engine constructs keys
- * from query token IDs via memcpy.
+ * The ngram_key is the raw n*token_width bytes from the data file packed into a u64
+ * (zero-extended, little-endian). Requires n*token_width <= 8.
  */
-fn cmd_build_bigram(data_file: &String, table_file: &String, bigram_file: &String,
-                    token_width: usize, ratio: usize) -> std::io::Result<()> {
+fn cmd_build_ngram(data_file: &String, table_file: &String, ngram_file: &String,
+                   token_width: usize, ratio: usize, ngram_n: usize) -> std::io::Result<()> {
     let now = Instant::now();
-    println!("Building bigram index for {}", data_file);
+    let ngram_bytes = ngram_n * token_width;
+    assert!(ngram_bytes <= 8, "{}-gram with token_width={} requires {} bytes, exceeds u64 (8 bytes)",
+            ngram_n, token_width, ngram_bytes);
+    println!("Building {}-gram index for {}", ngram_n, data_file);
 
     let ds = filebuffer::FileBuffer::open(data_file)?;
     let sa = filebuffer::FileBuffer::open(table_file)?;
 
     let ds_size = ds.len();
     let tok_cnt = ds_size / token_width;
-    let bigram_bytes = 2 * token_width;
 
     assert_eq!(sa.len(), tok_cnt * ratio, "SA size mismatch: expected {} * {} = {}, got {}",
                tok_cnt, ratio, tok_cnt * ratio, sa.len());
 
     // We stream entries to disk to avoid holding them all in memory
-    let mut out = std::io::BufWriter::new(File::create(bigram_file)?);
+    let mut out = std::io::BufWriter::new(File::create(ngram_file)?);
 
-    // Write placeholder header
+    // Write header: num_entries (placeholder), token_width, ngram_n
     let placeholder_num_entries: u64 = 0;
     out.write_all(&placeholder_num_entries.to_le_bytes())?;
     let tw = token_width as u32;
     out.write_all(&tw.to_le_bytes())?;
-    let padding = 0u32;
-    out.write_all(&padding.to_le_bytes())?;
+    let nn = ngram_n as u32;
+    out.write_all(&nn.to_le_bytes())?;
 
     let mut num_entries: u64 = 0;
     let mut prev_key: u64 = u64::MAX; // sentinel: no current group
@@ -699,8 +745,8 @@ fn cmd_build_bigram(data_file: &String, table_file: &String, bigram_file: &Strin
         ptr_bytes[..ratio].copy_from_slice(&sa[rank * ratio..rank * ratio + ratio]);
         let ptr = u64::from_le_bytes(ptr_bytes) as usize;
 
-        // Check if suffix is long enough for a 2-gram
-        if ptr + bigram_bytes > ds_size {
+        // Check if suffix is long enough for an n-gram
+        if ptr + ngram_bytes > ds_size {
             // Suffix too short — finalize current group if any
             if prev_key != u64::MAX {
                 out.write_all(&prev_key.to_le_bytes())?;
@@ -712,9 +758,9 @@ fn cmd_build_bigram(data_file: &String, table_file: &String, bigram_file: &Strin
             continue;
         }
 
-        // Pack the 2-gram bytes into a u64 key
+        // Pack the n-gram bytes into a u64 key
         let mut key_bytes = [0u8; 8];
-        key_bytes[..bigram_bytes].copy_from_slice(&ds[ptr..ptr + bigram_bytes]);
+        key_bytes[..ngram_bytes].copy_from_slice(&ds[ptr..ptr + ngram_bytes]);
         let key = u64::from_le_bytes(key_bytes);
 
         if key != prev_key {
@@ -742,11 +788,278 @@ fn cmd_build_bigram(data_file: &String, table_file: &String, bigram_file: &Strin
     drop(out);
 
     // Go back and write the actual num_entries in the header
-    let mut header_out = OpenOptions::new().write(true).open(bigram_file)?;
+    let mut header_out = OpenOptions::new().write(true).open(ngram_file)?;
     header_out.write_all(&num_entries.to_le_bytes())?;
 
-    println!("Bigram index built in {:.2}s, {} unique 2-grams written to {}",
-             now.elapsed().as_secs_f64(), num_entries, bigram_file);
+    println!("{}-gram index built in {:.2}s, {} unique {}-grams written to {}",
+             ngram_n, now.elapsed().as_secs_f64(), num_entries, ngram_n, ngram_file);
+    Ok(())
+}
+
+/*
+ * HeapEntry for the adaptive n-gram builder's priority queue.
+ * Max-heap by range_size, tie-break by key for determinism.
+ */
+#[derive(Clone, Eq, PartialEq)]
+struct HeapEntry {
+    range_size: u64,
+    key: u64,
+    lo: u64,
+    hi: u64,
+    n: usize,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.range_size.cmp(&other.range_size)
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/*
+ * Build an adaptive n-gram index that starts with complete bigrams, then
+ * greedily expands the n-grams with the largest SA ranges into higher-order
+ * entries, up to a fixed budget.
+ *
+ * File format (ANGR):
+ *   Header (32 bytes): magic "ANGR", version, token_width, max_n, num_levels, reserved, total_entries
+ *   Level directory (num_levels * 24 bytes): ngram_n, padding, num_entries, data_offset
+ *   Entry data (per level, sorted by key, 24 bytes each): key, lo, hi
+ */
+fn cmd_build_adaptive_ngram(data_file: &String, table_file: &String, output_file: &String,
+                            token_width: usize, ratio: usize, budget: u64,
+                            max_n: usize, min_range: u64) -> std::io::Result<()> {
+    let now = Instant::now();
+    assert!(max_n >= 2, "max_n must be >= 2");
+    assert!(max_n * token_width <= 8, "{}-gram with token_width={} exceeds u64", max_n, token_width);
+    println!("Building adaptive n-gram index (budget={}, max_n={}, min_range={})", budget, max_n, min_range);
+
+    let ds = filebuffer::FileBuffer::open(data_file)?;
+    let sa = filebuffer::FileBuffer::open(table_file)?;
+
+    let ds_size = ds.len();
+    let tok_cnt = ds_size / token_width;
+    let bigram_bytes = 2 * token_width;
+
+    assert_eq!(sa.len(), tok_cnt * ratio, "SA size mismatch");
+
+    // Helper to read SA pointer at a given rank
+    let read_ptr = |rank: u64| -> usize {
+        let r = rank as usize;
+        let mut ptr_bytes = [0u8; 8];
+        ptr_bytes[..ratio].copy_from_slice(&sa[r * ratio..r * ratio + ratio]);
+        u64::from_le_bytes(ptr_bytes) as usize
+    };
+
+    // --- Phase 1: Build complete bigram index via linear SA scan ---
+    println!("  Phase 1: scanning {} SA entries for bigrams...", tok_cnt);
+    let phase1_start = Instant::now();
+
+    let mut bigrams: Vec<(u64, u64, u64)> = Vec::new(); // (key, lo, hi)
+    let mut prev_key: u64 = u64::MAX;
+    let mut cur_lo: u64 = 0;
+
+    for rank in 0..tok_cnt {
+        let ptr = read_ptr(rank as u64);
+        if ptr + bigram_bytes > ds_size {
+            if prev_key != u64::MAX {
+                bigrams.push((prev_key, cur_lo, rank as u64));
+                prev_key = u64::MAX;
+            }
+            continue;
+        }
+        let mut key_bytes = [0u8; 8];
+        key_bytes[..bigram_bytes].copy_from_slice(&ds[ptr..ptr + bigram_bytes]);
+        let key = u64::from_le_bytes(key_bytes);
+
+        if key != prev_key {
+            if prev_key != u64::MAX {
+                bigrams.push((prev_key, cur_lo, rank as u64));
+            }
+            prev_key = key;
+            cur_lo = rank as u64;
+        }
+    }
+    if prev_key != u64::MAX {
+        bigrams.push((prev_key, cur_lo, tok_cnt as u64));
+    }
+
+    let num_bigrams = bigrams.len() as u64;
+    println!("  Phase 1 complete: {} bigrams in {:.2}s", num_bigrams, phase1_start.elapsed().as_secs_f64());
+
+    // --- Phase 2: Initialize heap and level storage ---
+    let num_levels = max_n - 1; // levels 2..=max_n
+    let mut levels: Vec<Vec<(u64, u64, u64)>> = vec![Vec::new(); num_levels];
+
+    // Level 0 = bigram (n=2), level 1 = trigram (n=3), etc.
+    for &(key, lo, hi) in &bigrams {
+        levels[0].push((key, lo, hi));
+    }
+
+    let effective_budget = if budget < num_bigrams {
+        println!("  WARNING: budget {} < num_bigrams {}, using bigrams only", budget, num_bigrams);
+        num_bigrams
+    } else {
+        budget
+    };
+
+    let mut total_entries = num_bigrams;
+
+    if max_n > 2 && total_entries < effective_budget {
+        // Initialize max-heap with expandable bigrams
+        let mut heap = BinaryHeap::new();
+        for &(key, lo, hi) in &bigrams {
+            let range_size = hi - lo;
+            if range_size >= min_range {
+                heap.push(HeapEntry { range_size, key, lo, hi, n: 2 });
+            }
+        }
+
+        // --- Phase 3: Greedy expansion loop ---
+        println!("  Phase 3: expanding (heap size={})...", heap.len());
+        let phase3_start = Instant::now();
+        let mut expansions: u64 = 0;
+
+        while total_entries < effective_budget {
+            let parent = match heap.pop() {
+                Some(e) => e,
+                None => break,
+            };
+
+            if parent.n >= max_n {
+                continue;
+            }
+
+            let child_n = parent.n + 1;
+            let child_ngram_bytes = child_n * token_width;
+            if child_ngram_bytes > 8 {
+                continue;
+            }
+
+            // Scan SA[parent.lo..parent.hi] to find (n+1)-gram children
+            let mut children: Vec<(u64, u64, u64)> = Vec::new();
+            let mut prev_child_key: u64 = u64::MAX;
+            let mut child_lo: u64 = parent.lo;
+
+            for rank in parent.lo..parent.hi {
+                let ptr = read_ptr(rank);
+                if ptr + child_ngram_bytes > ds_size {
+                    if prev_child_key != u64::MAX {
+                        children.push((prev_child_key, child_lo, rank));
+                        prev_child_key = u64::MAX;
+                    }
+                    continue;
+                }
+                let mut key_bytes = [0u8; 8];
+                key_bytes[..child_ngram_bytes].copy_from_slice(&ds[ptr..ptr + child_ngram_bytes]);
+                let key = u64::from_le_bytes(key_bytes);
+
+                if key != prev_child_key {
+                    if prev_child_key != u64::MAX {
+                        children.push((prev_child_key, child_lo, rank));
+                    }
+                    prev_child_key = key;
+                    child_lo = rank;
+                }
+            }
+            if prev_child_key != u64::MAX {
+                children.push((prev_child_key, child_lo, parent.hi));
+            }
+
+            if children.is_empty() {
+                continue;
+            }
+
+            let level_idx = child_n - 2; // 0-indexed: bigram=0, trigram=1, quadgram=2
+            let remaining = effective_budget - total_entries;
+
+            if (children.len() as u64) <= remaining {
+                // Add all children
+                for &(ckey, clo, chi) in &children {
+                    levels[level_idx].push((ckey, clo, chi));
+                    let child_range = chi - clo;
+                    if child_range >= min_range && child_n < max_n {
+                        heap.push(HeapEntry { range_size: child_range, key: ckey, lo: clo, hi: chi, n: child_n });
+                    }
+                }
+                total_entries += children.len() as u64;
+            } else {
+                // Partial expansion: take top children by range
+                children.sort_by(|a, b| (b.2 - b.1).cmp(&(a.2 - a.1)));
+                let take = remaining as usize;
+                for &(ckey, clo, chi) in &children[..take] {
+                    levels[level_idx].push((ckey, clo, chi));
+                }
+                total_entries += take as u64;
+                break;
+            }
+
+            expansions += 1;
+            if expansions % 100000 == 0 {
+                println!("    expanded {}, entries so far: {}/{}", expansions, total_entries, effective_budget);
+            }
+        }
+
+        println!("  Phase 3 complete: {} expansions in {:.2}s", expansions, phase3_start.elapsed().as_secs_f64());
+    }
+
+    // --- Phase 4: Write output file ---
+    // Sort each level's entries by key
+    for level in &mut levels {
+        level.sort_by_key(|&(key, _, _)| key);
+    }
+
+    let mut out = std::io::BufWriter::new(File::create(output_file)?);
+
+    // Header (32 bytes)
+    out.write_all(b"ANGR")?;                                    // magic
+    out.write_all(&1u32.to_le_bytes())?;                         // version
+    out.write_all(&(token_width as u32).to_le_bytes())?;         // token_width
+    out.write_all(&(max_n as u32).to_le_bytes())?;               // max_n
+    out.write_all(&(num_levels as u32).to_le_bytes())?;          // num_levels
+    out.write_all(&0u32.to_le_bytes())?;                         // reserved
+    out.write_all(&total_entries.to_le_bytes())?;                // total_entries
+
+    // Level directory (num_levels * 24 bytes)
+    let dir_start: u64 = 32;
+    let dir_size: u64 = (num_levels as u64) * 24;
+    let mut data_offset = dir_start + dir_size;
+
+    for (i, level) in levels.iter().enumerate() {
+        let ngram_n = (i + 2) as u32;
+        let count = level.len() as u64;
+        out.write_all(&ngram_n.to_le_bytes())?;                  // ngram_n
+        out.write_all(&0u32.to_le_bytes())?;                     // padding
+        out.write_all(&count.to_le_bytes())?;                    // num_entries
+        out.write_all(&data_offset.to_le_bytes())?;              // data_offset
+        data_offset += count * 24;
+    }
+
+    // Entry data
+    for level in &levels {
+        for &(key, lo, hi) in level {
+            out.write_all(&key.to_le_bytes())?;
+            out.write_all(&lo.to_le_bytes())?;
+            out.write_all(&hi.to_le_bytes())?;
+        }
+    }
+
+    out.flush()?;
+
+    // Print summary
+    println!("\nAdaptive n-gram index built in {:.2}s", now.elapsed().as_secs_f64());
+    println!("  Total entries: {}", total_entries);
+    for (i, level) in levels.iter().enumerate() {
+        println!("  Level {} ({}-gram): {} entries", i + 2, i + 2, level.len());
+    }
+    println!("  Written to {}", output_file);
+
     Ok(())
 }
 
@@ -772,7 +1085,19 @@ fn main()  -> std::io::Result<()> {
         }
 
         Commands::BuildBigram { data_file, table_file, bigram_file, token_width, ratio } => {
-            cmd_build_bigram(data_file, table_file, bigram_file, *token_width, *ratio)?;
+            cmd_build_ngram(data_file, table_file, bigram_file, *token_width, *ratio, 2)?;
+        }
+
+        Commands::BuildTrigram { data_file, table_file, trigram_file, token_width, ratio } => {
+            cmd_build_ngram(data_file, table_file, trigram_file, *token_width, *ratio, 3)?;
+        }
+
+        Commands::BuildQuadgram { data_file, table_file, quadgram_file, token_width, ratio } => {
+            cmd_build_ngram(data_file, table_file, quadgram_file, *token_width, *ratio, 4)?;
+        }
+
+        Commands::BuildAdaptiveNgram { data_file, table_file, output_file, token_width, ratio, budget, max_n, min_range } => {
+            cmd_build_adaptive_ngram(data_file, table_file, output_file, *token_width, *ratio, *budget, *max_n, *min_range)?;
         }
     }
 
