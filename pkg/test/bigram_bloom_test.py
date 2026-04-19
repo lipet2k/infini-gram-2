@@ -83,6 +83,11 @@ class SuffixArrayIndex:
         elif token_width == 4:
             self.dtype = np.uint32
 
+        # Build unigram cumulative array (for approx search methods)
+        self.unigram_cum = None
+        if self.unigram_cache is not None:
+            self.unigram_cum = self._build_unigram_cum()
+
     def _load_bigram_cache(self, path):
         """Load bigram cache into a dict mapping u64 key -> (lo, hi)."""
         with open(path, 'rb') as f:
@@ -170,6 +175,19 @@ class SuffixArrayIndex:
             else:
                 cache[t1] = (lo, hi)
         return cache
+
+    def _build_unigram_cum(self):
+        """Build cumulative unigram count array from unigram cache.
+
+        unigram_cum[t] = total #suffixes starting with a token < t.
+        Derived from the unigram ranges: count(t) == hi - lo of the SA range.
+        """
+        vocab_size = 1 << (self.token_width * 8)  # e.g. 65536 for u16
+        deltas = np.zeros(vocab_size + 1, dtype=np.int64)
+        for t, (lo, hi) in self.unigram_cache.items():
+            if 0 <= t < vocab_size:
+                deltas[t + 1] = hi - lo
+        return np.cumsum(deltas)
 
     def _make_bigram_key(self, token_ids):
         """Pack first 2 tokens into a u64 key (matching C++ _make_bigram_key)."""
@@ -273,6 +291,84 @@ class SuffixArrayIndex:
 
         return left, right, comparisons
 
+    def _exp_search_boundary(self, query_bytes, est, lo_bnd, hi_bnd, strict):
+        """Two-sided exponential search + binary refine.
+
+        strict=False -> smallest r in [lo_bnd, hi_bnd] with SA[r] >= query
+                        (left edge of match range)
+        strict=True  -> smallest r in [lo_bnd, hi_bnd] with SA[r] >  query
+                        (right edge of match range)
+
+        Returns (boundary_rank, num_comparisons).
+        """
+        if lo_bnd >= hi_bnd:
+            return lo_bnd, 0
+
+        num_bytes = len(query_bytes)
+        comparisons = [0]
+
+        def is_left(r):
+            comparisons[0] += 1
+            ptr = self._read_sa_ptr(r)
+            suffix = self._read_suffix_bytes(ptr, num_bytes)
+            if strict:
+                # SA[r] <= query   iff   not (query < SA[r])
+                return not (query_bytes < suffix)
+            else:
+                # SA[r] < query
+                return suffix < query_bytes
+
+        # Clamp estimate into [lo_bnd, hi_bnd - 1]
+        if est < lo_bnd:
+            est = lo_bnd
+        if est >= hi_bnd:
+            est = hi_bnd - 1
+
+        if is_left(est):
+            # Expand to the RIGHT
+            lo = est
+            step = 1
+            hi = hi_bnd
+            while True:
+                if est + step >= hi_bnd:
+                    hi = hi_bnd
+                    break
+                cand = est + step
+                if is_left(cand):
+                    lo = cand
+                    step <<= 1
+                else:
+                    hi = cand
+                    break
+        else:
+            # Expand to the LEFT
+            hi = est
+            step = 1
+            found_lo = False
+            lo = 0
+            while True:
+                cand = lo_bnd if step > est - lo_bnd else est - step
+                if is_left(cand):
+                    lo = cand
+                    found_lo = True
+                    break
+                else:
+                    hi = cand
+                    if cand == lo_bnd:
+                        break
+                    step <<= 1
+            if not found_lo:
+                return lo_bnd, comparisons[0]
+
+        # Binary refine in (lo, hi]
+        while hi - lo > 1:
+            m = (lo + hi) >> 1
+            if is_left(m):
+                lo = m
+            else:
+                hi = m
+        return hi, comparisons[0]
+
     def search_baseline(self, token_ids):
         """Search without any cache (full range)."""
         return self.binary_search(token_ids)
@@ -325,6 +421,76 @@ class SuffixArrayIndex:
                 return 0, 0, 0
         # Fall back to trigram for shorter queries
         return self.search_with_trigram(token_ids)
+
+    def search_with_1approx2(self, token_ids):
+        """Approx 2-gram search using unigram cache + exponential search.
+
+        Uses unigram(a)'s SA range as outer bound, estimates (a,b)'s sub-range
+        assuming the 2nd-token distribution inside matches the global unigram
+        CDF, then does two-sided exponential search outward from both estimates.
+        """
+        if len(token_ids) != 2 or self.unigram_cache is None or self.unigram_cum is None:
+            return self.binary_search(token_ids)
+
+        a, b = int(token_ids[0]), int(token_ids[1])
+        if a not in self.unigram_cache:
+            return 0, 0, 0
+
+        uni_a_lo, uni_a_hi = self.unigram_cache[a]
+        if uni_a_lo >= uni_a_hi:
+            return uni_a_lo, uni_a_lo, 0
+
+        total = self.tok_cnt
+        range_a = uni_a_hi - uni_a_lo
+        cum_b_lo = int(self.unigram_cum[b])
+        cum_b_hi = int(self.unigram_cum[b + 1])
+        est_lo = uni_a_lo + (range_a * cum_b_lo) // total
+        est_hi = uni_a_lo + (range_a * cum_b_hi) // total
+        est_lo = max(uni_a_lo, min(est_lo, uni_a_hi))
+        est_hi = max(uni_a_lo, min(est_hi, uni_a_hi))
+
+        query_bytes = self._token_ids_to_bytes([a, b])
+        left, c1 = self._exp_search_boundary(query_bytes, est_lo, uni_a_lo, uni_a_hi, strict=False)
+        right, c2 = self._exp_search_boundary(query_bytes, est_hi, uni_a_lo, uni_a_hi, strict=True)
+        if right < left:
+            right = left
+        return left, right, c1 + c2
+
+    def search_with_2approx3(self, token_ids):
+        """Approx 3-gram search using bigram cache + exponential search.
+
+        Uses bigram(a,b)'s SA range from the bigram cache as outer bound,
+        estimates (a,b,c)'s sub-range assuming the 3rd-token distribution
+        inside matches the global unigram CDF, then exponential search.
+        """
+        if (len(token_ids) != 3 or self.bigram_cache is None
+                or self.unigram_cum is None):
+            return self.binary_search(token_ids)
+
+        a, b, c = int(token_ids[0]), int(token_ids[1]), int(token_ids[2])
+        bi_key = self._make_ngram_key([a, b], 2)
+        if bi_key not in self.bigram_cache:
+            return 0, 0, 0
+
+        bi_lo, bi_hi = self.bigram_cache[bi_key]
+        if bi_lo >= bi_hi:
+            return bi_lo, bi_lo, 0
+
+        total = self.tok_cnt
+        range_ab = bi_hi - bi_lo
+        cum_c_lo = int(self.unigram_cum[c])
+        cum_c_hi = int(self.unigram_cum[c + 1])
+        est_lo = bi_lo + (range_ab * cum_c_lo) // total
+        est_hi = bi_lo + (range_ab * cum_c_hi) // total
+        est_lo = max(bi_lo, min(est_lo, bi_hi))
+        est_hi = max(bi_lo, min(est_hi, bi_hi))
+
+        query_bytes = self._token_ids_to_bytes([a, b, c])
+        left, c1 = self._exp_search_boundary(query_bytes, est_lo, bi_lo, bi_hi, strict=False)
+        right, c2 = self._exp_search_boundary(query_bytes, est_hi, bi_lo, bi_hi, strict=True)
+        if right < left:
+            right = left
+        return left, right, c1 + c2
 
     def bloom_check(self, token_ids):
         """
@@ -436,6 +602,7 @@ def test_correctness(index):
             'trigram': index.search_with_trigram(query),
             'quadgram': index.search_with_quadgram(query),
             'adaptive': index.search_with_adaptive(query),
+            '1approx2': index.search_with_1approx2(query),
         }
         all_match = all((r[1] - r[0]) == cnt_base for r in cnts.values())
         if all_match:
@@ -463,6 +630,7 @@ def test_correctness(index):
             'trigram': index.search_with_trigram(query),
             'quadgram': index.search_with_quadgram(query),
             'adaptive': index.search_with_adaptive(query),
+            '2approx3': index.search_with_2approx3(query),
             'bloom+bg': index.search_with_bloom_and_bigram(query),
             'bloom+tg': index.search_with_bloom_and_trigram(query),
             'bloom+qg': index.search_with_bloom_and_quadgram(query),
@@ -493,15 +661,26 @@ def test_correctness(index):
             'trigram': index.search_with_trigram(query),
             'quadgram': index.search_with_quadgram(query),
             'adaptive': index.search_with_adaptive(query),
+            '2approx3': index.search_with_2approx3(query),
             'bloom+bg': index.search_with_bloom_and_bigram(query),
             'bloom+tg': index.search_with_bloom_and_trigram(query),
             'bloom+qg': index.search_with_bloom_and_quadgram(query),
         }
-        all_match = all((r[1] - r[0]) == cnt_base for r in cnts.values())
+        # Also test 1approx2 on the first 2 tokens of the random query
+        q2 = query[:2]
+        cnt_base_2 = index.search_baseline(q2)[1] - index.search_baseline(q2)[0]
+        r_1a2 = index.search_with_1approx2(q2)
+        cnts_2 = {'1approx2': r_1a2}
+        all_match = (
+            all((r[1] - r[0]) == cnt_base for r in cnts.values())
+            and (r_1a2[1] - r_1a2[0]) == cnt_base_2
+        )
         if all_match:
             p3 += 1
         else:
             diffs = {k: r[1]-r[0] for k, r in cnts.items() if (r[1]-r[0]) != cnt_base}
+            if (r_1a2[1] - r_1a2[0]) != cnt_base_2:
+                diffs['1approx2'] = (r_1a2[1] - r_1a2[0], f'base2={cnt_base_2}')
             print(f"  FAIL: query={query}, baseline={cnt_base}, {diffs}")
             f3 += 1
     passed += p3
@@ -551,6 +730,38 @@ def test_correctness(index):
     passed += p5
     failed += f5
     print(f"  {p5} passed, {f5} failed")
+
+    # Test 6: Approx-search boundary correctness vs baseline on existing queries
+    print("\n--- Test 6: Approx-search exact-range check ---")
+    p6, f6 = 0, 0
+    for i in range(0, min(len(tokens) - 3, 80), 3):
+        t1, t2, t3 = int(tokens[i]), int(tokens[i + 1]), int(tokens[i + 2])
+        doc_sep = (1 << (index.token_width * 8)) - 1
+        if doc_sep in (t1, t2, t3):
+            continue
+
+        # 1approx2 should return the exact same [left, right) as baseline
+        q2 = [t1, t2]
+        lb, rb, _ = index.search_baseline(q2)
+        la, ra, _ = index.search_with_1approx2(q2)
+        if (lb, rb) == (la, ra):
+            p6 += 1
+        else:
+            print(f"  FAIL 1approx2: query={q2}, baseline=[{lb},{rb}), got=[{la},{ra})")
+            f6 += 1
+
+        # 2approx3 should return the exact same [left, right) as baseline
+        q3 = [t1, t2, t3]
+        lb, rb, _ = index.search_baseline(q3)
+        la, ra, _ = index.search_with_2approx3(q3)
+        if (lb, rb) == (la, ra):
+            p6 += 1
+        else:
+            print(f"  FAIL 2approx3: query={q3}, baseline=[{lb},{rb}), got=[{la},{ra})")
+            f6 += 1
+    passed += p6
+    failed += f6
+    print(f"  {p6} passed, {f6} failed")
 
     print(f"\n{'=' * 60}")
     print(f"TOTAL: {passed} passed, {failed} failed")
@@ -708,38 +919,53 @@ def test_performance(index, num_queries=500):
     labels = ["Baseline", "Unigram", "Bigram", "Trigram", "Quadgram",
               "Adaptive", "Bloom+Bigram", "Bloom+Trigram", "Bloom+Quadgram"]
 
-    def print_reductions(results):
+    # Separate function lists for the approx methods (only valid at their own n)
+    fns_2 = fns + [index.search_with_1approx2]
+    labels_2 = labels + ["1approx2"]
+    fns_3 = fns + [index.search_with_2approx3]
+    labels_3 = labels + ["2approx3"]
+
+    def print_reductions(results, lbls):
         if results[0][1] > 0:
-            for i, name in enumerate(labels[1:], 1):
+            for i, name in enumerate(lbls[1:], 1):
                 if i < len(results):
                     print(f"  Comparison reduction ({name:16s}): {(1 - results[i][1]/results[0][1])*100:.1f}%")
 
     # Benchmark existing 2-gram queries
     print(f"\n--- Existing 2-gram queries (n={len(existing_queries_2)}) ---")
-    results = benchmark_interleaved(existing_queries_2, fns)
-    for label, (t, c, r) in zip(labels, results):
+    results = benchmark_interleaved(existing_queries_2, fns_2)
+    for label, (t, c, r) in zip(labels_2, results):
         print(f"  {label+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
-    print_reductions(results)
+    print_reductions(results, labels_2)
 
     # Benchmark existing 3-gram queries
     print(f"\n--- Existing 3-gram queries (n={len(existing_queries_3)}) ---")
-    results = benchmark_interleaved(existing_queries_3, fns)
-    for label, (t, c, r) in zip(labels, results):
+    results = benchmark_interleaved(existing_queries_3, fns_3)
+    for label, (t, c, r) in zip(labels_3, results):
         print(f"  {label+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
-    print_reductions(results)
+    print_reductions(results, labels_3)
 
     # Benchmark existing 4-gram queries
     print(f"\n--- Existing 4-gram queries (n={len(existing_queries_4)}) ---")
     results = benchmark_interleaved(existing_queries_4, fns)
     for label, (t, c, r) in zip(labels, results):
         print(f"  {label+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
-    print_reductions(results)
+    print_reductions(results, labels)
 
-    # Benchmark non-existing queries
+    # Benchmark non-existing queries (include approx methods on 2-gram and 3-gram slices)
     print(f"\n--- Non-existing random queries (n={len(nonexist_queries)}) ---")
     results = benchmark_interleaved(nonexist_queries, fns)
     for label, (t, c, r) in zip(labels, results):
         print(f"  {label+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
+
+    nonexist_2 = [q[:2] for q in nonexist_queries]
+    nonexist_3 = [q[:3] for q in nonexist_queries]
+    r_1a2 = benchmark_interleaved(nonexist_2, [index.search_baseline, index.search_with_1approx2])
+    r_2a3 = benchmark_interleaved(nonexist_3, [index.search_baseline, index.search_with_2approx3])
+    for (lbl, (t, c, r)) in zip(["Baseline(2g)", "1approx2"], r_1a2):
+        print(f"  {lbl+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
+    for (lbl, (t, c, r)) in zip(["Baseline(3g)", "2approx3"], r_2a3):
+        print(f"  {lbl+':':19s} {t:.3f}s, avg {c:.1f} comparisons, {r:,} total results")
 
     # Count bloom filter rejections
     bloom_rejections = sum(1 for q in nonexist_queries if index.bloom_check(q))

@@ -156,8 +156,8 @@ public:
             if (prev_shards_by_index_dir.find(index_dir) != prev_shards_by_index_dir.end()) {
                 size_t num_prev = prev_shards_by_index_dir[index_dir].size();
                 _shards.insert(_shards.end(), prev_shards_by_index_dir[index_dir].begin(), prev_shards_by_index_dir[index_dir].end());
-                // Load bigram/trigram/quadgram caches for prev shards (they are small and cheap to reload)
-                vector<string> bg_paths_prev, tg_paths_prev, qg_paths_prev;
+                // Load bigram/trigram/quadgram/unigram caches for prev shards (they are small and cheap to reload)
+                vector<string> bg_paths_prev, tg_paths_prev, qg_paths_prev, ug_paths_prev;
                 if (fs::exists(index_dir)) {
                     for (const auto &entry : fs::directory_iterator(index_dir)) {
                         if (entry.path().string().find("quadgram") != string::npos) {
@@ -166,11 +166,14 @@ public:
                             tg_paths_prev.push_back(entry.path());
                         } else if (entry.path().string().find("bigram") != string::npos) {
                             bg_paths_prev.push_back(entry.path());
+                        } else if (entry.path().string().find("unigram") != string::npos) {
+                            ug_paths_prev.push_back(entry.path());
                         }
                     }
                     sort(bg_paths_prev.begin(), bg_paths_prev.end());
                     sort(tg_paths_prev.begin(), tg_paths_prev.end());
                     sort(qg_paths_prev.begin(), qg_paths_prev.end());
+                    sort(ug_paths_prev.begin(), ug_paths_prev.end());
                 }
                 for (size_t s = 0; s < num_prev; s++) {
                     if (s < bg_paths_prev.size()) {
@@ -190,6 +193,12 @@ public:
                     } else {
                         _has_quadgram_cache.push_back(false);
                         _quadgram_caches.push_back({});
+                    }
+                    if (s < ug_paths_prev.size()) {
+                        _load_unigram_cum_file(ug_paths_prev[s]);
+                    } else {
+                        _has_unigram_cum.push_back(false);
+                        _unigram_cum_by_shard.push_back({});
                     }
                 }
                 continue;
@@ -308,6 +317,14 @@ public:
                 } else {
                     _has_quadgram_cache.push_back(false);
                     _quadgram_caches.push_back({});
+                }
+
+                // Load per-shard unigram cumulative counts for approx methods
+                if (s < ug_paths.size()) {
+                    _load_unigram_cum_file(ug_paths[s]);
+                } else {
+                    _has_unigram_cum.push_back(false);
+                    _unigram_cum_by_shard.push_back({});
                 }
             }
         }
@@ -1552,7 +1569,228 @@ public:
         return AttributionResult{ .spans = attribution_spans, };
     }
 
+    FindResult find_1approx2(const std::vector<T> input_ids) const {
+        assert(input_ids.size() == 2);
+        T a = input_ids[0], b = input_ids[1];
+        std::vector<std::pair<U64, U64>> segment_by_shard(_num_shards);
+        std::vector<std::thread> threads;
+        for (size_t s = 0; s < _num_shards; s++) {
+            threads.emplace_back(&Engine::_find_1approx2_thread, this,
+                                s, a, b, &segment_by_shard[s]);
+        }
+        for (auto &t : threads) t.join();
+        U64 cnt = 0;
+        for (const auto &seg : segment_by_shard) cnt += seg.second - seg.first;
+        return FindResult{ .cnt = cnt, .segment_by_shard = segment_by_shard };
+    }
+    
+    FindResult find_2approx3(const std::vector<T> input_ids) const {
+        assert(input_ids.size() == 3);
+        T a = input_ids[0], b = input_ids[1], c = input_ids[2];
+        std::vector<std::pair<U64, U64>> segment_by_shard(_num_shards);
+        std::vector<std::thread> threads;
+        for (size_t s = 0; s < _num_shards; s++) {
+            threads.emplace_back(&Engine::_find_2approx3_thread, this,
+                                s, a, b, c, &segment_by_shard[s]);
+        }
+        for (auto &t : threads) t.join();
+        U64 cnt = 0;
+        for (const auto &seg : segment_by_shard) cnt += seg.second - seg.first;
+        return FindResult{ .cnt = cnt, .segment_by_shard = segment_by_shard };
+    }
+
 private:
+
+    void _load_unigram_cum_file(const std::string &path) {
+        std::ifstream f(path);
+        assert(f.is_open());
+        std::string line;
+        std::map<T, U64> counts;
+        T linenum = 0;
+        while (std::getline(f, line)) {
+            T token_id;
+            U64 count;
+            if (line.find(" ") != std::string::npos) {
+                std::istringstream iss(line);
+                iss >> token_id >> count;
+            } else {
+                token_id = linenum;
+                std::istringstream iss(line);
+                iss >> count;
+            }
+            counts[token_id] = count;
+            linenum++;
+        }
+        std::vector<U64> cum((size_t)_vocab_size + 1, 0);
+        for (size_t t = 0; t < (size_t)_vocab_size; t++) {
+            auto it = counts.find((T)t);
+            U64 c = (it != counts.end()) ? it->second : 0;
+            cum[t + 1] = cum[t] + c;
+        }
+        _has_unigram_cum.push_back(true);
+        _unigram_cum_by_shard.push_back(std::move(cum));
+    }
+    
+    // Exponential search + binary refine, constrained to [lo_bnd, hi_bnd].
+    // Finds the smallest rank r in [lo_bnd, hi_bnd] such that SA[r] is NOT "left of boundary":
+    //   strict=false -> boundary is "first SA[r] >= query"  (left edge of match range)
+    //   strict=true  -> boundary is "first SA[r] >  query"  (right edge of match range)
+    // Returns hi_bnd if every SA entry in the range is strictly left of the boundary.
+    U64 _exp_search_boundary(
+        const DatastoreShard &shard,
+        const U8* const input_buf,
+        const U64 num_bytes,
+        U64 est,
+        const U64 lo_bnd,
+        const U64 hi_bnd,
+        const bool strict) const {
+    
+        if (lo_bnd >= hi_bnd) return lo_bnd;
+    
+        // is_left(r) == true  means rank r is on the "below boundary" side.
+        auto is_left = [&](U64 r) -> bool {
+            U64 ptr = _convert_rank_to_ptr(shard, r);
+            const U8* sa_begin = shard.ds + ptr;
+            const U8* sa_end   = shard.ds + std::min(ptr + num_bytes, shard.ds_size);
+            if (strict) {
+                // SA[r] <= query  iff  NOT (query < SA[r])
+                return !std::lexicographical_compare(
+                    input_buf, input_buf + num_bytes, sa_begin, sa_end);
+            } else {
+                // SA[r] < query
+                return std::lexicographical_compare(
+                    sa_begin, sa_end, input_buf, input_buf + num_bytes);
+            }
+        };
+    
+        // Clamp estimate inside [lo_bnd, hi_bnd - 1]
+        if (est < lo_bnd) est = lo_bnd;
+        if (est >= hi_bnd) est = hi_bnd - 1;
+    
+        U64 lo, hi; // post-bracket invariant: is_left(lo), !is_left(hi) OR hi == hi_bnd sentinel
+    
+        if (is_left(est)) {
+            // Expand to the RIGHT: find first rank where !is_left
+            lo = est;
+            U64 step = 1;
+            hi = hi_bnd;
+            while (true) {
+                if (est + step >= hi_bnd) { hi = hi_bnd; break; }
+                U64 cand = est + step;
+                if (is_left(cand)) {
+                    lo = cand;
+                    step <<= 1;
+                } else {
+                    hi = cand;
+                    break;
+                }
+            }
+        } else {
+            // Expand to the LEFT: find last rank where is_left (or hit lo_bnd)
+            hi = est;
+            U64 step = 1;
+            bool found_lo = false;
+            lo = 0;
+            while (true) {
+                U64 cand = (step > est - lo_bnd) ? lo_bnd : (est - step);
+                if (is_left(cand)) {
+                    lo = cand;
+                    found_lo = true;
+                    break;
+                } else {
+                    hi = cand;
+                    if (cand == lo_bnd) break;
+                    step <<= 1;
+                }
+            }
+            if (!found_lo) return lo_bnd; // nothing in [lo_bnd, est] is left of boundary
+        }
+    
+        // Binary refine inside (lo, hi]
+        while (hi - lo > 1) {
+            U64 m = (lo + hi) >> 1;
+            if (is_left(m)) lo = m; else hi = m;
+        }
+        return hi;
+    }
+    
+    void _find_1approx2_thread(
+        const size_t s,
+        const T a, const T b,
+        std::pair<U64, U64>* const out_segment) const {
+    
+        const auto &shard = _shards[s];
+    
+        if (!_has_unigram_cum[s] || a >= (T)_vocab_size || b >= (T)_vocab_size) {
+            *out_segment = {0, 0}; return;
+        }
+        const auto &cum = _unigram_cum_by_shard[s];
+    
+        U64 uni_a_lo = cum[a];
+        U64 uni_a_hi = cum[a + 1];
+        if (uni_a_lo >= uni_a_hi) { *out_segment = {uni_a_lo, uni_a_lo}; return; }
+    
+        // Approximation: within uni(a) range, 2nd-token positions follow global unigram CDF
+        U64 total = shard.tok_cnt;
+        U64 range_a = uni_a_hi - uni_a_lo;
+        U64 est_lo = uni_a_lo + (U64)((long double)range_a * cum[b]     / (long double)total);
+        U64 est_hi = uni_a_lo + (U64)((long double)range_a * cum[b + 1] / (long double)total);
+        if (est_lo < uni_a_lo) est_lo = uni_a_lo;
+        if (est_hi > uni_a_hi) est_hi = uni_a_hi;
+    
+        // Build query bytes (handle v5 reversal)
+        std::vector<T> query;
+        if (_version == 4) query = {a, b};
+        else               query = {b, a};
+        const U8* input_buf = reinterpret_cast<const U8*>(query.data());
+        U64 num_bytes = 2 * sizeof(T);
+    
+        U64 left  = _exp_search_boundary(shard, input_buf, num_bytes, est_lo, uni_a_lo, uni_a_hi, false);
+        U64 right = _exp_search_boundary(shard, input_buf, num_bytes, est_hi, uni_a_lo, uni_a_hi, true);
+        if (right < left) right = left;
+    
+        *out_segment = {left, right};
+    }
+    
+    void _find_2approx3_thread(
+        const size_t s,
+        const T a, const T b, const T c,
+        std::pair<U64, U64>* const out_segment) const {
+    
+        const auto &shard = _shards[s];
+    
+        if (!_has_bigram_cache[s] || !_has_unigram_cum[s] || c >= (T)_vocab_size) {
+            *out_segment = {0, 0}; return;
+        }
+    
+        // Outer SA range comes from the 2-gram cache produced by build_bigram.
+        U64 bi_key = _make_ngram_key({a, b}, 2);
+        auto it = _bigram_caches[s].find(bi_key);
+        if (it == _bigram_caches[s].end()) { *out_segment = {0, 0}; return; }
+        U64 bi_lo = it->second.first;
+        U64 bi_hi = it->second.second;
+        if (bi_lo >= bi_hi) { *out_segment = {bi_lo, bi_lo}; return; }
+    
+        const auto &cum = _unigram_cum_by_shard[s];
+        U64 total = shard.tok_cnt;
+        U64 range_ab = bi_hi - bi_lo;
+        U64 est_lo = bi_lo + (U64)((long double)range_ab * cum[c]     / (long double)total);
+        U64 est_hi = bi_lo + (U64)((long double)range_ab * cum[c + 1] / (long double)total);
+        if (est_lo < bi_lo) est_lo = bi_lo;
+        if (est_hi > bi_hi) est_hi = bi_hi;
+    
+        std::vector<T> query;
+        if (_version == 4) query = {a, b, c};
+        else               query = {c, b, a};
+        const U8* input_buf = reinterpret_cast<const U8*>(query.data());
+        U64 num_bytes = 3 * sizeof(T);
+    
+        U64 left  = _exp_search_boundary(shard, input_buf, num_bytes, est_lo, bi_lo, bi_hi, false);
+        U64 right = _exp_search_boundary(shard, input_buf, num_bytes, est_hi, bi_lo, bi_hi, true);
+        if (right < left) right = left;
+    
+        *out_segment = {left, right};
+    }
 
     void _prefetch_find(const DatastoreShard &shard, const U64 num_bytes, const U64 lo, const U64 hi, const size_t depth = 0) const {
         U64 mi = (lo + hi) >> 1;
@@ -1752,6 +1990,8 @@ private:
     vector<unordered_map<U64, pair<U64, U64>>> _trigram_caches;
     vector<bool> _has_quadgram_cache;
     vector<unordered_map<U64, pair<U64, U64>>> _quadgram_caches;
+    vector<bool> _has_unigram_cum;
+    vector<vector<U64>> _unigram_cum_by_shard;  // [s][t] = #tokens < t in shard s
 
     friend class EngineDiff<T>;
 };
