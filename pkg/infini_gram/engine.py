@@ -4,7 +4,6 @@ from typing import Iterable, List, Optional, Tuple, Dict
 from .models import *
 from . import cpp_engine
 from . import py_engine
-from .bloom_filter import load_bloom_filters, query_ids_to_bytes
 
 class InfiniGramEngine:
 
@@ -74,34 +73,11 @@ class InfiniGramEngine:
         else:
             raise ValueError(f'Unsupported read type: {read_type}')
 
-        self.bloom_filters = load_bloom_filters(index_dir, self.token_width)
-
     def compute_unigram_counts(self, s: int) -> List[int]:
         return self.engine.compute_unigram_counts(s=s)
 
     def get_new_shards_by_index_dir(self):
         return self.engine.get_new_shards_by_index_dir()
-
-    def bloom_check(self, query_ids: QueryIdsType) -> bool:
-        """Check bloom filters for a short n-gram query.
-        Returns True if the query DEFINITELY does not exist (all shards reject).
-        Returns False if the query might exist (bloom filter absent or any shard says maybe).
-        """
-        n = len(query_ids)
-        if n < 2 or n > 4 or not self.bloom_filters:
-            return False
-        ids = query_ids
-        if self.version == 5:
-            ids = list(reversed(ids))
-        key = query_ids_to_bytes(ids, self.token_width)
-        for bf in self.bloom_filters:
-            if bf is None:
-                return False  # no filter for this shard, can't reject
-            if bf.max_ngram_n < n:
-                return False  # filter doesn't cover this n-gram size
-            if bf.maybe_contains(key):
-                return False  # at least one shard says maybe
-        return True  # all shards say definitely not
 
     def check_query_ids(self, query_ids: QueryIdsType, allow_empty: bool) -> bool:
         if not (type(query_ids) == list and (allow_empty or len(query_ids) > 0)):
@@ -128,9 +104,6 @@ class InfiniGramEngine:
     def find(self, input_ids: QueryIdsType) -> InfiniGramEngineResponse[FindResponse]:
         if not self.check_query_ids(input_ids, allow_empty=True):
             return {'error': f'input_ids must be a list of integers in range [0, {self.token_id_max}]'}
-        if self.bloom_check(input_ids):
-            num_shards = self.engine.get_num_shards()
-            return {'cnt': 0, 'segment_by_shard': [(0, 0)] * num_shards}
         result = self.engine.find(input_ids=input_ids)
         return {'cnt': result.cnt, 'segment_by_shard': result.segment_by_shard}
 
@@ -151,8 +124,6 @@ class InfiniGramEngine:
     def count(self, input_ids: QueryIdsType) -> InfiniGramEngineResponse[CountResponse]:
         if not self.check_query_ids(input_ids, allow_empty=True):
             return {'error': f'input_ids must be a list of integers in range [0, {self.token_id_max}]'}
-        if self.bloom_check(input_ids):
-            return {'count': 0, 'approx': False}
         result = self.engine.count(input_ids=input_ids)
         return {'count': result.count, 'approx': result.approx}
 

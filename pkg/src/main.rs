@@ -113,21 +113,6 @@ enum Commands {
         token_width: usize,
     },
 
-    BuildBloom {
-        #[clap(short, long)]
-        data_file: String,
-        #[clap(long)]
-        bloom_file: String,
-        #[clap(long)]
-        num_bits: u64,
-        #[clap(long, default_value_t = 7)]
-        num_hashes: u32,
-        #[clap(long, default_value_t = 4)]
-        max_ngram_n: u32,
-        #[clap(short, long)]
-        token_width: usize,
-    },
-
     BuildBigram {
         #[clap(short, long)]
         data_file: String,
@@ -488,7 +473,6 @@ fn cmd_merge(fpath: &String, parts_dir: &String, merged_dir: &String, num_thread
         // // found in the merge process. If this happens we'll warn once.
         // let mut did_warn_long_sequences = false;
 
-        let mut prev = &texts[0][0..];
         while let Some(MergeState {suffix: _suffix, position, table_index, hacksize}) = heap.pop() {
             next_table.write_all(&(position + delta[table_index] as u64).to_le_bytes()[..ratio]).expect("Write OK");
 
@@ -625,72 +609,6 @@ fn cmd_concat(fpath: &String, merged_dir: &String, merged_file: &String, num_thr
         }
     });
 
-    Ok(())
-}
-
-fn fnv1a(key: &[u8], seed: u64) -> u64 {
-    let mut h = seed;
-    for &b in key {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3u64);
-    }
-    h
-}
-
-fn bloom_insert(data: &mut [u8], num_bits: u64, num_hashes: u32, key: &[u8]) {
-    let h1 = fnv1a(key, 0xcbf29ce484222325u64);
-    let h2 = fnv1a(key, 0x517cc1b727220a95u64);
-    for i in 0..num_hashes as u64 {
-        let bit = h1.wrapping_add(i.wrapping_mul(h2)) % num_bits;
-        data[(bit / 8) as usize] |= 1 << (bit % 8);
-    }
-}
-
-fn cmd_build_bloom(data_file: &String, bloom_file: &String,
-                   num_bits: u64, num_hashes: u32, max_ngram_n: u32,
-                   token_width: usize) -> std::io::Result<()> {
-    let now = Instant::now();
-    println!("Building bloom filter for {}", data_file);
-
-    let ds = filebuffer::FileBuffer::open(data_file)?;
-    let tok_cnt = ds.len() / token_width;
-
-    let num_bytes = ((num_bits + 7) / 8) as usize;
-    let mut bloom_data = vec![0u8; num_bytes];
-
-    // doc_sep is all 0xFF bytes of token_width length
-    let doc_sep: Vec<u8> = vec![0xffu8; token_width];
-
-    let mut tokens_since_sep: u64 = 0;
-
-    for pos in 0..tok_cnt {
-        let byte_offset = pos * token_width;
-        let token_bytes = &ds[byte_offset..byte_offset + token_width];
-
-        if token_bytes == &doc_sep[..] {
-            tokens_since_sep = 0;
-            continue;
-        }
-        tokens_since_sep += 1;
-
-        for n in 2..=max_ngram_n {
-            if tokens_since_sep >= n as u64 {
-                let start = (pos + 1 - n as usize) * token_width;
-                let end = (pos + 1) * token_width;
-                bloom_insert(&mut bloom_data, num_bits, num_hashes, &ds[start..end]);
-            }
-        }
-    }
-
-    // Write: header (num_bits: 8 bytes, num_hashes: 4 bytes, max_ngram_n: 4 bytes) + data
-    let mut out = File::create(bloom_file)?;
-    out.write_all(&num_bits.to_le_bytes())?;
-    out.write_all(&num_hashes.to_le_bytes())?;
-    out.write_all(&max_ngram_n.to_le_bytes())?;
-    out.write_all(&bloom_data)?;
-
-    println!("Bloom filter built in {:.2}s, {} bytes written to {}",
-             now.elapsed().as_secs_f64(), 16 + bloom_data.len(), bloom_file);
     Ok(())
 }
 
@@ -1078,10 +996,6 @@ fn main()  -> std::io::Result<()> {
 
         Commands::Concat { data_file, merged_dir, merged_file, num_threads, ratio, token_width } => {
             cmd_concat(data_file, merged_dir, merged_file, *num_threads, *ratio, *token_width)?;
-        }
-
-        Commands::BuildBloom { data_file, bloom_file, num_bits, num_hashes, max_ngram_n, token_width } => {
-            cmd_build_bloom(data_file, bloom_file, *num_bits, *num_hashes, *max_ngram_n, *token_width)?;
         }
 
         Commands::BuildBigram { data_file, table_file, bigram_file, token_width, ratio } => {
