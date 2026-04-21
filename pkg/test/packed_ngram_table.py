@@ -6,9 +6,8 @@ import bisect
 
 import numpy as np
 
-
+# Packed, searchable n-gram -> (lo, hi) table backed by a binary file.
 class PackedRangeTable:
-    """Packed, searchable n-gram -> (lo, hi) table backed by a binary file."""
 
     RECORD_DTYPE = np.dtype([("key", "<u8"), ("lo", "<u8"), ("hi", "<u8")])
     RAW_KEY_DTYPE = np.dtype("V8")

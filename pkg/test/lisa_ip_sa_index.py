@@ -6,9 +6,8 @@ import time
 
 import numpy as np
 
-
+ # Linear regression model y = slope * (x - x0) + intercept for LISA.
 class LinearModel:
-    """Simple linear regression model y ~= slope * (x - x0) + intercept."""
 
     __slots__ = ('x0', 'slope', 'intercept')
 
@@ -20,10 +19,8 @@ class LinearModel:
     def predict(self, x):
         return self.slope * (float(x) - self.x0) + self.intercept
 
-
+# Leaf model over a contiguous key range for LISA.
 class LisaLeaf:
-    """Leaf model over a contiguous key range."""
-
     __slots__ = ('start', 'end', 'min_key', 'max_key', 'model', 'avg_error', 'max_abs_error')
 
     def __init__(self, start, end, min_key, max_key, model, avg_error, max_abs_error):
@@ -35,10 +32,8 @@ class LisaLeaf:
         self.avg_error = avg_error
         self.max_abs_error = max_abs_error
 
-
+# Suffix-array analogue of LISA's IP-BWT + RMI exact search.
 class LisaIndex:
-    """Suffix-array analogue of LISA's IP-BWT + RMI exact search."""
-
     def __init__(self, index, k_tokens=2, leaf_alpha=16.0):
         self.index = index
         self.k_tokens = int(k_tokens)

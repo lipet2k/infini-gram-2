@@ -3,15 +3,12 @@ WARNING: EXPERIMENTAL CODE. This code is used to verify the performance of the L
 This implementation is entirely experimental see https://khoury.northeastern.edu/home/pandey/courses/cs7800/spring26/papers/lisa.pdf for 
 more details.
 
-Build a small suffix-array slice index and benchmark a LISA search
-against the existing query methods on the same data.
+To run:
 
-This uses the existing Rust indexing binary to create a shard-local slice
-index, then reuses the benchmark harness in ngram_query_benchmark.py.
+python test/lisa_benchmark.py
+python test/lisa_benchmark.py --slice-tokens 250000 --num-queries 1000
 
-Usage:
-    python test/lisa_benchmark.py
-    python test/lisa_benchmark.py --slice-tokens 250000 --num-queries 1000
+or ask Peter to run it for you.
 """
 
 import argparse
@@ -214,11 +211,11 @@ def main():
         lisa_leaf_alpha=args.lisa_leaf_alpha,
     )
 
-    print()
+    print("=" * 60)
     print(f"Loaded slice index with {index.tok_cnt:,} tokens and ptr_size={index.ptr_size}")
     print(f"LISA chunk size: {index.lisa.k_tokens}, leaves: {len(index.lisa.leaves):,}, "
           f"avg leaf error: {index.lisa.avg_leaf_error:.2f}")
-    print()
+    print("=" * 60)
 
     all_passed = test_correctness(index)
     test_performance(index, num_queries=args.num_queries)

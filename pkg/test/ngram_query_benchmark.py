@@ -1,8 +1,9 @@
 """
-Benchmark exact and approximate suffix-array query methods with packed n-gram hints.
+To run:
 
-Usage:
-    python test/ngram_query_benchmark.py [--index-dir test/maildir_index]
+python test/ngram_query_benchmark.py [--index-dir test/maildir_index]
+
+or ask Peter to run it for you.
 """
 
 import argparse

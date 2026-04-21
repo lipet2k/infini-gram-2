@@ -10,10 +10,8 @@ from fixed_ngram_prefix_slab import FixedNgramPrefixSlab
 from lisa_ip_sa_index import LisaIndex
 from packed_ngram_table import PackedRangeTable
 
-
+# Loads and queries a single-shard infini-gram index.
 class SuffixArrayQueryIndex:
-    """Loads and queries a single-shard infini-gram index."""
-
     def __init__(
         self, index_dir, token_width=2, build_lisa=False, lisa_k=2, lisa_leaf_alpha=16.0
     ):

@@ -10,10 +10,9 @@ import numpy as np
 
 from packed_ngram_table import PackedRangeTable
 
-
+# Metadata wrapper around one level of the fixed prefix slab.
 class PrefixSlabLevel:
-    """Thin metadata wrapper around one level of the fixed prefix slab."""
-
+    
     def __init__(self, slab, ngram_n, num_entries, mem_bytes_estimate):
         self.slab = slab
         self.ngram_n = int(ngram_n)
@@ -26,16 +25,15 @@ class PrefixSlabLevel:
     def close(self):
         return None
 
-
+# Packed in-memory trie over the n-gram cache files.
 class FixedNgramPrefixSlab:
-    """Packed in-memory trie over the fixed 2/3/4-gram cache files."""
 
     RECORD_DTYPE = PackedRangeTable.RECORD_DTYPE
 
     def __init__(self, bigram_path, trigram_path, quadgram_path, token_width, tok_cnt):
         if token_width not in (1, 2):
             raise ValueError(
-                f"Prefix slab is only implemented for token_width 1 or 2, got {token_width}"
+                f"Fixed n-gram prefix slab is only implemented for token_width 1 or 2, got {token_width}"
             )
 
         self.token_width = int(token_width)
