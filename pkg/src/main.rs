@@ -743,7 +743,7 @@ impl PartialOrd for HeapEntry {
 /*
  * Build an adaptive n-gram index that starts with complete bigrams, then
  * greedily expands the n-grams with the largest SA ranges into higher-order
- * entries, up to a fixed budget.
+ * entries, up to a fixed budget. Inspired by adaptive range filters.
  *
  * File format (ANGR):
  *   Header (32 bytes): magic "ANGR", version, token_width, max_n, num_levels, reserved, total_entries

@@ -14,30 +14,31 @@ from packed_ngram_table import PackedRangeTable
 class SuffixArrayQueryIndex:
     """Loads and queries a single-shard infini-gram index."""
 
-    def __init__(self, index_dir, token_width=2,
-                 build_lisa=False, lisa_k=2, lisa_leaf_alpha=16.0):
+    def __init__(
+        self, index_dir, token_width=2, build_lisa=False, lisa_k=2, lisa_leaf_alpha=16.0
+    ):
         self.token_width = token_width
         self.index_dir = index_dir
         self._perf_active = False
         self._perf_sa_time = 0.0
 
-        ds_path = os.path.join(index_dir, 'tokenized.0')
+        ds_path = os.path.join(index_dir, "tokenized.0")
         self.ds_size = os.path.getsize(ds_path)
         self.tok_cnt = self.ds_size // token_width
-        self.ds_file = open(ds_path, 'rb')
+        self.ds_file = open(ds_path, "rb")
         self.ds_mmap = mmap.mmap(self.ds_file.fileno(), 0, access=mmap.ACCESS_READ)
 
-        sa_path = os.path.join(index_dir, 'table.0')
+        sa_path = os.path.join(index_dir, "table.0")
         sa_size = os.path.getsize(sa_path)
         self.ptr_size = sa_size // self.tok_cnt
-        self.sa_file = open(sa_path, 'rb')
+        self.sa_file = open(sa_path, "rb")
         self.sa_mmap = mmap.mmap(self.sa_file.fileno(), 0, access=mmap.ACCESS_READ)
 
         self.prefix_slab = None
 
-        bg_path = os.path.join(index_dir, 'bigram.0')
-        tg_path = os.path.join(index_dir, 'trigram.0')
-        qg_path = os.path.join(index_dir, 'quadgram.0')
+        bg_path = os.path.join(index_dir, "bigram.0")
+        tg_path = os.path.join(index_dir, "trigram.0")
+        qg_path = os.path.join(index_dir, "quadgram.0")
         self.bigram_cache = None
         self.trigram_cache = None
         self.quadgram_cache = None
@@ -54,7 +55,7 @@ class SuffixArrayQueryIndex:
                 if os.path.exists(qg_path):
                     self.quadgram_cache = self._load_ngram_cache(qg_path)
 
-        adaptive_path = os.path.join(index_dir, 'adaptive_ngram.0')
+        adaptive_path = os.path.join(index_dir, "adaptive_ngram.0")
         self.adaptive_cache = None
         if os.path.exists(adaptive_path):
             self.adaptive_cache = self._load_adaptive_ngram(adaptive_path)
@@ -91,22 +92,26 @@ class SuffixArrayQueryIndex:
             self._perf_sa_time += elapsed
 
     def _load_bigram_cache(self, path):
-        with open(path, 'rb') as f:
-            num_entries, = struct.unpack('<Q', f.read(8))
-            tw, = struct.unpack('<I', f.read(4))
-            _padding, = struct.unpack('<I', f.read(4))
+        with open(path, "rb") as f:
+            (num_entries,) = struct.unpack("<Q", f.read(8))
+            (tw,) = struct.unpack("<I", f.read(4))
+            (_padding,) = struct.unpack("<I", f.read(4))
             assert tw == self.token_width
             data_offset = f.tell()
-        return PackedRangeTable(path, num_entries, data_offset, ngram_n=2, sort_order='lex_bytes')
+        return PackedRangeTable(
+            path, num_entries, data_offset, ngram_n=2, sort_order="lex_bytes"
+        )
 
     def _load_ngram_cache(self, path):
-        with open(path, 'rb') as f:
-            num_entries, = struct.unpack('<Q', f.read(8))
-            tw, = struct.unpack('<I', f.read(4))
-            ngram_n, = struct.unpack('<I', f.read(4))
+        with open(path, "rb") as f:
+            (num_entries,) = struct.unpack("<Q", f.read(8))
+            (tw,) = struct.unpack("<I", f.read(4))
+            (ngram_n,) = struct.unpack("<I", f.read(4))
             assert tw == self.token_width
             data_offset = f.tell()
-        return PackedRangeTable(path, num_entries, data_offset, ngram_n=ngram_n, sort_order='lex_bytes')
+        return PackedRangeTable(
+            path, num_entries, data_offset, ngram_n=ngram_n, sort_order="lex_bytes"
+        )
 
     def _load_prefix_slab(self, bigram_path, trigram_path, quadgram_path):
         trigram_in = trigram_path if os.path.exists(trigram_path) else None
@@ -151,17 +156,17 @@ class SuffixArrayQueryIndex:
         return self._make_ngram_key(token_ids, 2)
 
     def _make_ngram_key(self, token_ids, ngram_n):
-        key_bytes = b''
+        key_bytes = b""
         for i in range(ngram_n):
-            key_bytes += int(token_ids[i]).to_bytes(self.token_width, 'little')
-        key_bytes += b'\x00' * (8 - ngram_n * self.token_width)
-        return struct.unpack('<Q', key_bytes)[0]
+            key_bytes += int(token_ids[i]).to_bytes(self.token_width, "little")
+        key_bytes += b"\x00" * (8 - ngram_n * self.token_width)
+        return struct.unpack("<Q", key_bytes)[0]
 
     def _read_sa_ptr(self, rank):
         offset = rank * self.ptr_size
-        raw = self.sa_mmap[offset:offset + self.ptr_size]
-        padded = raw + b'\x00' * (8 - self.ptr_size)
-        return struct.unpack('<Q', padded)[0]
+        raw = self.sa_mmap[offset : offset + self.ptr_size]
+        padded = raw + b"\x00" * (8 - self.ptr_size)
+        return struct.unpack("<Q", padded)[0]
 
     def _read_suffix_bytes(self, ptr, num_bytes):
         end = min(ptr + num_bytes, self.ds_size)
@@ -356,7 +361,11 @@ class SuffixArrayQueryIndex:
         return self.search_with_trigram(token_ids)
 
     def search_with_1approx2(self, token_ids):
-        if len(token_ids) != 2 or self.unigram_cache is None or self.unigram_cum is None:
+        if (
+            len(token_ids) != 2
+            or self.unigram_cache is None
+            or self.unigram_cum is None
+        ):
             return self.binary_search(token_ids)
 
         a, b = int(token_ids[0]), int(token_ids[1])
@@ -377,8 +386,12 @@ class SuffixArrayQueryIndex:
         est_hi = max(uni_a_lo, min(est_hi, uni_a_hi))
 
         query_bytes = self._token_ids_to_bytes([a, b])
-        left, c1 = self._exp_search_boundary(query_bytes, est_lo, uni_a_lo, uni_a_hi, strict=False)
-        right, c2 = self._exp_search_boundary(query_bytes, est_hi, uni_a_lo, uni_a_hi, strict=True)
+        left, c1 = self._exp_search_boundary(
+            query_bytes, est_lo, uni_a_lo, uni_a_hi, strict=False
+        )
+        right, c2 = self._exp_search_boundary(
+            query_bytes, est_hi, uni_a_lo, uni_a_hi, strict=True
+        )
         if right < left:
             right = left
         return left, right, c1 + c2
@@ -409,8 +422,12 @@ class SuffixArrayQueryIndex:
         est_hi = max(bi_lo, min(est_hi, bi_hi))
 
         query_bytes = self._token_ids_to_bytes([a, b, c])
-        left, c1 = self._exp_search_boundary(query_bytes, est_lo, bi_lo, bi_hi, strict=False)
-        right, c2 = self._exp_search_boundary(query_bytes, est_hi, bi_lo, bi_hi, strict=True)
+        left, c1 = self._exp_search_boundary(
+            query_bytes, est_lo, bi_lo, bi_hi, strict=False
+        )
+        right, c2 = self._exp_search_boundary(
+            query_bytes, est_hi, bi_lo, bi_hi, strict=True
+        )
         if right < left:
             right = left
         return left, right, c1 + c2
@@ -439,7 +456,7 @@ class SuffixArrayQueryIndex:
 
     def close(self):
         for cache in (self.bigram_cache, self.trigram_cache, self.quadgram_cache):
-            if cache is not None and hasattr(cache, 'close'):
+            if cache is not None and hasattr(cache, "close"):
                 cache.close()
         if self.adaptive_cache is not None:
             self.adaptive_cache.close()

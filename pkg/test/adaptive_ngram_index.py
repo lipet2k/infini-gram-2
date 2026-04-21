@@ -4,7 +4,7 @@ from packed_ngram_table import PackedRangeTable
 
 
 class AdaptiveNgramIndex:
-    """Packed adaptive n-gram index with shorter-prefix fallback semantics."""
+    """Packed adaptive n-gram index with shorter-prefix fallback."""
 
     def __init__(self, path, token_width):
         self.path = path

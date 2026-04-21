@@ -1,3 +1,7 @@
+# WARNING: EXPERIMENTAL CODE. This code is used to verify the performance of the LISA index. This index is not used in the final report.
+# This implementation is entirely experimental see https://khoury.northeastern.edu/home/pandey/courses/cs7800/spring26/papers/lisa.pdf for 
+# more details.
+
 import time
 
 import numpy as np

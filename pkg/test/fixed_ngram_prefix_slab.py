@@ -1,3 +1,7 @@
+# WARNING: EXPERIMENTAL CODE. This code is used to verify the ability of the adaptive n-gram to improve suffix-array query performance.
+# This implementation is entirely experimental and demonstrates the improvement in query performance, after reducing comparisons in
+# binary search. See https://www.cs.sfu.ca/~ashriram/Courses/CS295/assets/books/CSAPP_2016.pdf Chapter 2 for more details.
+
 import bisect
 import os
 import struct

@@ -1,5 +1,9 @@
 """
-Build a small suffix-array slice index and benchmark a LISA-style search
+WARNING: EXPERIMENTAL CODE. This code is used to verify the performance of the LISA index. This index is not used in the final report.
+This implementation is entirely experimental see https://khoury.northeastern.edu/home/pandey/courses/cs7800/spring26/papers/lisa.pdf for 
+more details.
+
+Build a small suffix-array slice index and benchmark a LISA search
 against the existing query methods on the same data.
 
 This uses the existing Rust indexing binary to create a shard-local slice

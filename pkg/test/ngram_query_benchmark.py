@@ -17,7 +17,6 @@ from suffix_array_query_index import SuffixArrayIndex
 
 
 def test_correctness(index):
-    """Verify that the cache-backed query paths produce correct results."""
     print("=" * 60)
     print("CORRECTNESS TESTS")
     print("=" * 60)
